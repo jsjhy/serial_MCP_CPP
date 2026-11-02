@@ -1,0 +1,5 @@
+// Embed the supplied bitmap as a multi-size Windows icon; no runtime image file is needed.
+#include "resource.h"
+IDI_APP ICON "ZhiNanXinYi.ico"
+// Windows 11 control manifest, embedded at build time; no external runtime manifest is required.
+1 24 "app.manifest"

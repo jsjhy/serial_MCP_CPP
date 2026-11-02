@@ -1,0 +1,17 @@
+# GUI/MCP configuration: CLI > file > defaults. port/baud configure only the startup session.
+# port = "COM8"
+baud = 115200
+mode = "both"
+mcp_port = 8010
+log_dir = "logs"
+log_rotate = 10485760
+log_keep_days = 30
+log_flush_bytes = 4096
+log_flush_ms = 100
+[gui]
+# Legacy [tui] is accepted. Themes affect GUI rendering only; file logs remain plain text.
+theme = "dark"
+line_ending = "crlf"
+hex_view = false
+input_hex = false
+max_lines = 500

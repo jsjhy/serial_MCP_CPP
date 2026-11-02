@@ -1,0 +1,9 @@
+# Generated builds, releases and local logs.
+/build/
+/dist/
+/logs/
+/test-results.txt
+
+# Python bytecode caches.
+__pycache__/
+*.pyc

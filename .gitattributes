@@ -1,0 +1,4 @@
+# Keep formatter output stable across Windows and Unix checkouts.
+* text=auto eol=lf
+*.bmp binary
+*.ico binary
