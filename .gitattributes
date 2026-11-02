@@ -2,3 +2,4 @@
 * text=auto eol=lf
 *.bmp binary
 *.ico binary
+*.exe binary

@@ -1,6 +1,6 @@
-# Generated builds, releases and local logs.
+# Generated build output and local logs.
 /build/
-/dist/
+/dist/logs/
 /logs/
 /test-results.txt
 
