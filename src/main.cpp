@@ -14,6 +14,10 @@ int application(std::vector<std::wstring> args)
     {
         return self_test();
     }
+    if (std::find(args.begin(), args.end(), L"--stress-test") != args.end())
+    {
+        return receive_stress_test();
+    }
     Config cfg = options(args);
     SessionManager sessions(cfg);
     auto primary = sessions.get();
@@ -139,7 +143,8 @@ int application(std::vector<std::wstring> args)
 
 static int entry(std::vector<std::wstring> args)
 {
-    bool testing = std::find(args.begin(), args.end(), L"--self-test") != args.end();
+    bool testing = std::find(args.begin(), args.end(), L"--self-test") != args.end() ||
+                   std::find(args.begin(), args.end(), L"--stress-test") != args.end();
     bool helper = args.size() > 1 && args[1] == L"--internal-restart-helper";
     try
     {

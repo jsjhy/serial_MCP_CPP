@@ -69,6 +69,34 @@ int self_test()
     }
     check(visible.find(L"中😀!") != std::wstring::npos, "partial line assembly");
     check(first.pieces.front().color == palette.dim, "dim timestamp");
+    // Composing patches must equal sequential UTF-16 replacements, including split Unicode/ANSI.
+    Display sequential(palette);
+    Display batched(palette);
+    Patch combined;
+    std::wstring expected;
+    for (auto bytes : {std::string("prefix "),
+             std::string("\xe4\xb8", 2),
+             std::string("\xad", 1) + "\x1b[32mOK",
+             std::string("\nnext😀")})
+    {
+        Record record{Direction::Rx, bytes, "12:34:56.789"};
+        auto patch = sequential.feed(record, false);
+        expected.resize(expected.size() - size_t(patch.erase));
+        for (auto& piece : patch.pieces)
+        {
+            expected += piece.text;
+        }
+        combined.append(batched.feed(record, false));
+    }
+    std::wstring actual;
+    for (auto& piece : combined.pieces)
+    {
+        actual += piece.text;
+    }
+    check(
+        combined.erase == 0 && actual == expected,
+        "batched patch composition preserves split text"
+    );
     TextParser parser(palette.fg);
     std::wstring decoded;
     COLORREF received = 0;
@@ -105,6 +133,28 @@ int self_test()
             }
         );
         check(!f.get().empty(), "queued send failure");
+        // A huge record must not bypass a UI tick's byte budget; history remains unsplit.
+        core.publish(Direction::Rx, std::string(128 * 1024, 'q'));
+        auto display_batch = core.drain(64, 8192);
+        size_t batch_bytes = 0;
+        for (auto& record : display_batch)
+        {
+            batch_bytes += record.data.size();
+        }
+        check(batch_bytes <= 8192, "display drain byte budget");
+        check(
+            core.history(1).front().data.size() == 128 * 1024,
+            "UI slicing preserves MCP history"
+        );
+        for (int i = 0; i < 1030; ++i)
+        {
+            core.publish(Direction::Rx, "");
+        }
+        check(
+            core.events_.size() <= 1024 && core.event_bytes_ <= 4 * 1024 * 1024 &&
+                core.state().display_dropped > 0,
+            "display queue bounded even for empty records"
+        );
         native_tests(core, log, restart);
         ++checks;
         log.push({Direction::Rx, std::string("\xe4\xb8", 2), stamp(true)});

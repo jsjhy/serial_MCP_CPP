@@ -47,10 +47,15 @@ struct CoreState
     uint64_t rx = 0;
     uint64_t tx = 0;
     uint64_t dropped = 0;
+    uint64_t display_dropped = 0; // UI queue eviction count, independent of file logging.
 };
 
 class Core
 {
+    // Synthetic receive benchmark may exercise the real bounded publication path without hardware.
+    friend int receive_stress_test();
+    friend int self_test();
+
     struct Connection
     {
         Handle port;
@@ -110,7 +115,9 @@ public:
     std::string send(const std::string& bytes);
     std::string signals(bool dtr, bool rts);
     CoreState state();
-    std::vector<Record> drain(size_t limit = 256);
+    // Both record count and raw bytes are bounded; oversized records continue on the next call.
+    // This consumes only the display queue, leaving log/history records unchanged.
+    std::vector<Record> drain(size_t limit = 64, size_t byte_limit = 32 * 1024);
     std::vector<Record> history(size_t limit);
     void notice(std::string text);
     void mcp(std::string text);

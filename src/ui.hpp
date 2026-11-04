@@ -8,4 +8,5 @@ namespace sm
 int gui(SessionManager& sessions, Restart& restart, Config config);
 void native_tests(Core& core, LogWriter& log, Restart& restart);
 int self_test();
+int receive_stress_test();
 } // namespace sm

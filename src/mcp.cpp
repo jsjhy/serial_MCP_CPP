@@ -823,6 +823,7 @@ Json Mcp::call(const std::string& name, const Json& a)
                     {"connected", state.connected},
                     {"rx_bytes", int64_t(state.rx)},
                     {"tx_bytes", int64_t(state.tx)},
+                    {"display_dropped", int64_t(state.display_dropped)},
                     {"notice", state.notice},
                     {"log_dir", utf8(session->config.log_dir.wstring())},
                     {"log_file", session->log.filename()},

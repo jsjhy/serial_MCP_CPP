@@ -35,7 +35,7 @@ cmake --build build/cross --parallel 4
 
 GUI 顶部串口/波特率组合框和 共用的 Connect / Disconnect 按钮及 Refresh 按钮；连接按钮按实际状态显示 Connect 或 Disconnect，操作期间暂时禁用，完成后恢复；MCP 改变连接状态时也会同步。ASCII/HEX 同步切换输入/显示，EOL 切换行尾，Clear 清空显示但保留草稿。直接在显示区末尾输入，Enter 发送（空 Enter 可发 CRLF），失败保留；窗口关闭按钮退出。标题栏使用浅色系统样式，Windows 11 外边框不绘制额外描边。鼠标选择后右键或 Ctrl+C 复制，原生剪切/粘贴可用于草稿。选中历史时暂停显示刷新，日志继续。状态为 CONNECTED / DISCONNECTED / NOT_FOUND；单独显示 log 文件名，底部单行显示当前页的 serial_id 和 MCP 会话状态，可直接对应 MCP 工具参数。
 
-顶部标签页显示独立会话 ID、端口及 ON/OFF；末尾 `+` 新建并选中新页，每页右侧 `X` 关闭并移除对应会话（包括后台页），至少保留一页。每页独立保留草稿、显示、滚动/选择、ASCII/HEX、行尾、波特率及连接状态。切换标签页不关闭串口，后台页继续接收和记录。GUI 支持 ANSI 16/256/真彩前景色和暗淡时间戳。
+标题栏与标签页仿照 Windows 11 Edge 合为一行，使用浅灰蓝标题区、圆角标签和与内容区衔接的白色活动标签，`+` 紧跟标签排列；左侧图标保留系统菜单/About，右侧保留最小化、最大化和关闭按钮（操作交给 Windows 标准窗口过程）；空白处可拖动/双击，窗口边缘可缩放。标签页显示独立会话 ID、端口及 ON/OFF；末尾 `+` 新建并选中新页，每页右侧 `X` 关闭并移除对应会话（包括后台页），至少保留一页。每页独立保留草稿、显示、滚动/选择、ASCII/HEX、行尾、波特率及连接状态。切换标签页不关闭串口，后台页继续接收和记录，但暂停渲染；返回时从有界显示队列继续。GUI 支持 ANSI 16/256/真彩前景色和暗淡时间戳。
 
 最多 16 个活动串口会话。每个 SerialSession 拥有独立 Core（接收/任务线程）、LogWriter（日志线程）、有界发送队列、历史与显示缓存。SessionManager 目录锁不参与设备 I/O 或等待线程退出；删除时撤下目录并停止/回收资源，在途请求持有 shared_ptr，旧引用不能重新打开已删除会话。三个线程/会话，缓存预算按会话累加。同一物理端口不能重复占用，Windows 驱动的独占打开失败会明确报告。
 
@@ -47,7 +47,7 @@ GUI 顶部串口/波特率组合框和 共用的 Connect / Disconnect 按钮及 
 
 十一项工具：list_ports、list_sessions、create_session、remove_session、open、close、send、read、set_dtr_rts、export_log、restart。
 
-- `list_sessions {}`：返回 JSON 文本，包含 sessions 数组，每项有 serial_id、port、baud、connected、收发计数、日志目录/文件及错误。
+- `list_sessions {}`：返回 JSON 文本，包含 sessions 数组，每项有 serial_id、port、baud、connected、收发计数、display_dropped（显示队列丢弃条数）、日志目录/文件及错误。
 - `create_session {}`：创建空白会话，返回包含 serial_id 的 JSON 文本。
 - `remove_session {"serial_id":"serial-2"}`：停止并移除指定会话，至少保留一个；日志退出写盘失败时在移除后报告错误。
 - `open {"serial_id":"serial-2","port":"COM9","baud":115200}`：打开指定会话。
@@ -82,3 +82,15 @@ HTTP MCP 客户端会话最多 128 个、五分钟空闲过期；HTTP 请求体�
 Python 脚本均从自身位置定位项目，可从任意工作目录调用；`python format.py --help`、`python verify.py --help` 查看选项。排版工具优先使用项目内安装，其次 PATH；可用 `--formatter PATH` 指定。
 
 独立检查 EXE 的静态运行库导入：`python verify.py --binaries dist/serial_mcp_gui.exe`，不启动程序。
+
+## 大量接收与资源检查
+
+界面每次最多消费 64 条、32 KiB 原始数据，将跨包残行补丁合并为一次 RichEdit RTF 插入与重绘。RTF 对设备文本进行转义，保留 Unicode、颜色、草稿和选区；隐藏/最小化页面不持续渲染。普通 ASCII 按最多 512 字符的块处理，减少逐字节分配和 Windows 编码转换调用。日志临时批次同时限制条数和字节数。
+
+每会话显示队列最多 1024 条/4 MiB、历史最多 4096 条/4 MiB；超负载或长时间选择历史时会跳过旧显示记录，状态栏显示 `display skipped`，恢复显示时插入缺口提示。此计数仅表示界面队列，日志写入独立运行；慢盘或写盘错误仍受前述日志边界约束。减小日志轮转文件大小不会减少总写入量或界面刷新量。
+
+`dist/serial_mcp_gui.exe --stress-test` 使用三个会话和模拟接收数据，经过真实日志、缓存及原生 GUI 路径，不打开串口；后半程切换 HEX。默认 18 秒，可通过环境变量 `SERIAL_MCP_STRESS_SECONDS` 设置 5–300 秒。输出逐秒私有内存、工作集、句柄、GDI/USER、线程和最长消息处理时间；进程结束清理临时日志。此模式仅用于诊断，不作为 CTest 的机器性能门槛，也不代表真实设备或长期无泄漏保证。
+
+2026-11-03 的修复前后测量与限制见项目根目录 `RECEIVE_PERFORMANCE.md`。
+
+About 对话框中的 GitHub 项目地址为可点击超链接，使用系统默认浏览器打开；打开失败时显示错误提示。

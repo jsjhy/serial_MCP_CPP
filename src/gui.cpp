@@ -3,6 +3,9 @@
 #include "ui.hpp"
 #include "resource.h"
 #include <cassert>
+#include <psapi.h>
+#include <cstring>
+#include <tlhelp32.h>
 
 namespace sm
 {
@@ -102,6 +105,41 @@ void window_icons(WNDCLASSEXW& window_class)
     }
 }
 
+// EM_STREAMIN consumes this stack-owned source synchronously; no callback survives the call.
+struct RtfStream
+{
+    std::string text;
+    size_t offset = 0;
+
+    static DWORD CALLBACK read(DWORD_PTR cookie, LPBYTE buffer, LONG capacity, LONG* copied)
+    {
+        auto& source = *reinterpret_cast<RtfStream*>(cookie);
+        size_t count = std::min(size_t(std::max(capacity, 0L)), source.text.size() - source.offset);
+        std::memcpy(buffer, source.text.data() + source.offset, count);
+        source.offset += count;
+        *copied = LONG(count);
+        return 0;
+    }
+};
+
+// Restore painting even if formatting/allocation throws; never leave a window redraw-disabled.
+struct RedrawGuard
+{
+    HWND window;
+
+    explicit RedrawGuard(HWND target)
+        : window(target)
+    {
+        SendMessageW(window, WM_SETREDRAW, FALSE, 0);
+    }
+
+    ~RedrawGuard()
+    {
+        SendMessageW(window, WM_SETREDRAW, TRUE, 0);
+        InvalidateRect(window, nullptr, FALSE);
+    }
+};
+
 struct Font
 {
     HFONT value = nullptr;
@@ -154,6 +192,7 @@ struct App
     std::optional<std::future<std::string>>
         connection_job; // UI-owned receipt; blocks duplicate clicks.
     long boundary = 0;
+    uint64_t last_display_dropped = 0;
     std::vector<std::pair<std::future<std::string>, bool>> jobs;
     uint64_t scan = 0;
     bool hex;
@@ -377,6 +416,7 @@ struct App
                 "log:" + log.filename() + " | input/view:" + (hex ? "hex" : "ascii") +
                 " | rx:" + std::to_string(s.rx) + "B tx:" + std::to_string(s.tx) +
                 "B dropped:" + std::to_string(s.dropped) +
+                " | display skipped:" + std::to_string(s.display_dropped) +
                 (log.error().empty() ? "" : " | log error: " + log.error())
             )
         );
@@ -415,6 +455,89 @@ struct App
         }
     }
 
+    // Insert an entire colored batch in one RichEdit operation rather than one operation per run.
+    // Device text is escaped; it cannot inject RTF. Unicode uses signed UTF-16 RTF code units.
+    void insert_pieces(const std::vector<Piece>& pieces)
+    {
+        if (pieces.empty())
+        {
+            return;
+        }
+        std::vector<COLORREF> colors;
+        std::map<COLORREF, size_t> indices;
+        for (auto& piece : pieces)
+        {
+            if (!indices.count(piece.color))
+            {
+                colors.push_back(piece.color);
+                indices[piece.color] = colors.size();
+            }
+        }
+        LOGFONTW font{};
+        GetObjectW(mono.value, sizeof font, &font);
+        int half_points = std::max(
+            1,
+            MulDiv(std::abs(font.lfHeight), 144, std::max(int(GetDpiForWindow(terminal)), 96))
+        );
+        RtfStream source;
+        source.text =
+            "{\\rtf1\\ansi\\uc1\\deff0{\\fonttbl{\\f0\\fmodern Cascadia Mono;}}{\\colortbl;";
+        for (auto value : colors)
+        {
+            source.text += "\\red" + std::to_string(GetRValue(value)) + "\\green" +
+                           std::to_string(GetGValue(value)) + "\\blue" +
+                           std::to_string(GetBValue(value)) + ";";
+        }
+        source.text += "}\\f0\\fs" + std::to_string(half_points) + " ";
+        for (auto& piece : pieces)
+        {
+            source.text += "\\cf" + std::to_string(indices.at(piece.color)) + " ";
+            for (wchar_t unit : piece.text)
+            {
+                if (unit == L'\r' || unit == L'\n')
+                {
+                    source.text += "\\par ";
+                }
+                else if (unit == L'\t')
+                {
+                    source.text += "\\tab ";
+                }
+                else if (unit == L'\\' || unit == L'{' || unit == L'}')
+                {
+                    source.text += '\\';
+                    source.text += char(unit);
+                }
+                else if (unit >= 32 && unit < 127)
+                {
+                    source.text += char(unit);
+                }
+                else
+                {
+                    int value = int(unit);
+                    if (value >= 32768)
+                    {
+                        value -= 65536;
+                    }
+                    source.text += "\\u" + std::to_string(value) + "?";
+                }
+            }
+        }
+        source.text += '}';
+        EDITSTREAM stream{};
+        stream.dwCookie = reinterpret_cast<DWORD_PTR>(&source);
+        stream.pfnCallback = RtfStream::read;
+        SendMessageW(
+            terminal,
+            EM_STREAMIN,
+            SF_RTF | SFF_SELECTION,
+            reinterpret_cast<LPARAM>(&stream)
+        );
+        if (stream.dwError)
+        {
+            throw std::runtime_error("RichEdit batch insertion failed");
+        }
+    }
+
     void apply(Patch patch)
     {
         if (patch.pieces.empty() && !patch.erase)
@@ -426,15 +549,14 @@ struct App
         POINT scroll{};
         SendMessageW(terminal, EM_GETSCROLLPOS, 0, reinterpret_cast<LPARAM>(&scroll));
         bool follow = chosen.cpMin >= old;
-        SendMessageW(terminal, WM_SETREDRAW, FALSE, 0);
+        RedrawGuard redraw(terminal);
         long remove = std::min(old, patch.erase);
         select(terminal, old - remove, old);
         boundary -= remove;
-        for (auto& p : patch.pieces)
+        insert_pieces(patch.pieces);
+        for (auto& piece : patch.pieces)
         {
-            color(terminal, p.color);
-            SendMessageW(terminal, EM_REPLACESEL, FALSE, reinterpret_cast<LPARAM>(p.text.c_str()));
-            boundary += long(p.text.size());
+            boundary += long(piece.text.size());
         }
         color(terminal, palette.fg);
         long delta = boundary - old;
@@ -470,8 +592,6 @@ struct App
         {
             SendMessageW(terminal, EM_SETSCROLLPOS, 0, reinterpret_cast<LPARAM>(&scroll));
         }
-        SendMessageW(terminal, WM_SETREDRAW, TRUE, 0);
-        InvalidateRect(terminal, nullptr, FALSE);
     }
 
     void clear()
@@ -628,6 +748,10 @@ struct App
                 ++i;
             }
         }
+        if (!IsWindowVisible(window) || IsIconic(GetAncestor(window, GA_ROOT)))
+        {
+            return;
+        }
         if (GetTickCount64() - scan >= 1000)
         {
             scan = GetTickCount64();
@@ -639,13 +763,23 @@ struct App
         {
             return;
         }
-        for (auto& r : core.drain())
+        Patch batch;
+        auto state = core.state();
+        if (state.display_dropped != last_display_dropped)
         {
-            if (r.dir != Direction::Status)
+            display.reset();
+            batch.pieces.push_back({L"\r[display backlog skipped; see file log]\r", palette.dim});
+            last_display_dropped = state.display_dropped;
+        }
+        // A fixed byte budget bounds decoding and the RTF payload even for a single huge record.
+        for (auto& record : core.drain(64, 32 * 1024))
+        {
+            if (record.dir != Direction::Status)
             {
-                apply(display.feed(r, hex));
+                batch.append(display.feed(record, hex));
             }
         }
+        apply(std::move(batch));
     }
 
     static LRESULT CALLBACK
@@ -834,7 +968,7 @@ void make_window(App& a, bool visible, HWND parent = nullptr)
 } // namespace
 
 // The workspace owns tabs and child windows. Each Panel destroys App before releasing its session reference.
-// Background pages consume their own events and retain partial lines, drafts, selections and scroll positions.
+// Background pages retain UI state without rendering; bounded RX events and file logging continue independently.
 namespace
 {
 struct Workspace
@@ -850,9 +984,13 @@ struct Workspace
     Config config;
     HWND window = nullptr;
     HWND tabs = nullptr;
+    // Owned until all child controls are destroyed by the Workspace destructor.
+    Font tab_font;
     std::map<std::string, Panel> panels;
     std::vector<std::string> keys;
     std::string active;
+    LRESULT hot_caption = HTNOWHERE;
+    LRESULT pressed_caption = HTNOWHERE;
 
     Workspace(SessionManager& manager, Restart& restarter, Config settings)
         : sessions(manager),
@@ -867,6 +1005,201 @@ struct Workspace
         {
             DestroyWindow(window);
         }
+    }
+
+    int scaled(int pixels) const
+    {
+        return MulDiv(pixels, std::max(int(GetDpiForWindow(window)), 96), 96);
+    }
+
+    int header_height() const
+    {
+        return scaled(40);
+    }
+
+    // The client owns this compact row. Keep a zero glass margin so GDI child tabs stay visible.
+    void caption_frame()
+    {
+        MARGINS margins{};
+        DwmExtendFrameIntoClientArea(window, &margins);
+    }
+
+    LRESULT caption_hit_test(LPARAM position)
+    {
+        POINT point{SHORT(LOWORD(position)), SHORT(HIWORD(position))};
+        ScreenToClient(window, &point);
+        RECT area{};
+        GetClientRect(window, &area);
+        if (!IsZoomed(window))
+        {
+            int border = scaled(6);
+            bool left = point.x < border;
+            bool right = point.x >= area.right - border;
+            bool top = point.y < border;
+            bool bottom = point.y >= area.bottom - border;
+            if (top && left)
+            {
+                return HTTOPLEFT;
+            }
+            if (top && right)
+            {
+                return HTTOPRIGHT;
+            }
+            if (bottom && left)
+            {
+                return HTBOTTOMLEFT;
+            }
+            if (bottom && right)
+            {
+                return HTBOTTOMRIGHT;
+            }
+            if (left)
+            {
+                return HTLEFT;
+            }
+            if (right)
+            {
+                return HTRIGHT;
+            }
+            if (top)
+            {
+                return HTTOP;
+            }
+            if (bottom)
+            {
+                return HTBOTTOM;
+            }
+        }
+        if (point.y < header_height())
+        {
+            if (point.x >= area.right - scaled(46))
+            {
+                return HTCLOSE;
+            }
+            if (point.x >= area.right - scaled(92))
+            {
+                return HTMAXBUTTON;
+            }
+            if (point.x >= area.right - scaled(138))
+            {
+                return HTMINBUTTON;
+            }
+            if (point.x < scaled(36))
+            {
+                return HTSYSMENU;
+            }
+            return HTCAPTION;
+        }
+        return HTCLIENT;
+    }
+
+    // Paint compact caption glyphs with stock GDI objects. Native HT* hit codes still
+    // delegate dragging, system menus and caption-button commands to DefWindowProc.
+    void paint_caption()
+    {
+        PAINTSTRUCT paint{};
+        HDC dc = BeginPaint(window, &paint);
+        RECT header{};
+        GetClientRect(window, &header);
+        header.bottom = header_height();
+        SetDCBrushColor(dc, RGB(232, 236, 241));
+        FillRect(dc, &header, static_cast<HBRUSH>(GetStockObject(DC_BRUSH)));
+        HICON icon = reinterpret_cast<HICON>(GetClassLongPtrW(window, GCLP_HICONSM));
+        int size = scaled(16);
+        DrawIconEx(
+            dc,
+            scaled(10),
+            (header_height() - size) / 2,
+            icon,
+            size,
+            size,
+            0,
+            nullptr,
+            DI_NORMAL
+        );
+        int saved = SaveDC(dc);
+        int width = scaled(46);
+        int center_y = header_height() / 2;
+        for (int i = 0; i < 3; ++i)
+        {
+            LRESULT hit = i == 0 ? HTMINBUTTON : i == 1 ? HTMAXBUTTON : HTCLOSE;
+            RECT button{header.right - (3 - i) * width,
+                0,
+                header.right - (2 - i) * width,
+                header_height()};
+            bool hot = hot_caption == hit;
+            if (hot)
+            {
+                SelectObject(dc, GetStockObject(DC_BRUSH));
+                SetDCBrushColor(dc, hit == HTCLOSE ? RGB(196, 43, 28) : RGB(230, 230, 230));
+                FillRect(dc, &button, static_cast<HBRUSH>(GetStockObject(DC_BRUSH)));
+            }
+            SelectObject(dc, GetStockObject(DC_PEN));
+            SetDCPenColor(dc, hot && hit == HTCLOSE ? RGB(255, 255, 255) : RGB(30, 30, 30));
+            int center_x = (button.left + button.right) / 2;
+            int radius = scaled(5);
+            if (hit == HTMINBUTTON)
+            {
+                MoveToEx(dc, center_x - radius, center_y, nullptr);
+                LineTo(dc, center_x + radius + 1, center_y);
+            }
+            else if (hit == HTMAXBUTTON)
+            {
+                SelectObject(dc, GetStockObject(HOLLOW_BRUSH));
+                if (IsZoomed(window))
+                {
+                    Rectangle(
+                        dc,
+                        center_x - radius + 2,
+                        center_y - radius,
+                        center_x + radius + 1,
+                        center_y + radius - 1
+                    );
+                    Rectangle(
+                        dc,
+                        center_x - radius,
+                        center_y - radius + 2,
+                        center_x + radius - 1,
+                        center_y + radius + 1
+                    );
+                }
+                else
+                {
+                    Rectangle(
+                        dc,
+                        center_x - radius,
+                        center_y - radius,
+                        center_x + radius + 1,
+                        center_y + radius + 1
+                    );
+                }
+            }
+            else
+            {
+                MoveToEx(dc, center_x - radius, center_y - radius, nullptr);
+                LineTo(dc, center_x + radius + 1, center_y + radius + 1);
+                MoveToEx(dc, center_x + radius, center_y - radius, nullptr);
+                LineTo(dc, center_x - radius - 1, center_y + radius + 1);
+            }
+        }
+        if (saved)
+        {
+            RestoreDC(dc, saved);
+        }
+        EndPaint(window, &paint);
+    }
+
+    void caption_hover(LRESULT hit)
+    {
+        if (hot_caption == hit)
+        {
+            return;
+        }
+        hot_caption = hit;
+        RECT row{};
+        GetClientRect(window, &row);
+        row.bottom = header_height();
+        InvalidateRect(window, &row, FALSE);
     }
 
     // Registry snapshots release the manager lock. Only the GUI thread creates, destroys and selects controls.
@@ -955,10 +1288,26 @@ struct Workspace
         }
         RECT area{};
         GetClientRect(window, &area);
-        MoveWindow(tabs, 8, 8, std::max(area.right - 16L, 100L), 30, TRUE);
+        RECT caption_buttons{};
+        int reserved = scaled(150);
+        if (SUCCEEDED(DwmGetWindowAttribute(window, 5, &caption_buttons, sizeof caption_buttons)))
+        {
+            reserved = std::max(reserved, int(caption_buttons.right - caption_buttons.left));
+        }
+        // Leave a draggable gap before the system buttons even with many overflowing tabs.
+        int left = scaled(36);
+        int width = std::max(int(area.right) - left - reserved - scaled(48), scaled(100));
+        MoveWindow(tabs, left, scaled(3), width, header_height() - scaled(3), TRUE);
         for (auto& [id, panel] : panels)
         {
-            MoveWindow(panel.app->window, 0, 44, area.right, std::max(area.bottom - 44L, 0L), TRUE);
+            MoveWindow(
+                panel.app->window,
+                0,
+                header_height(),
+                area.right,
+                std::max(area.bottom - header_height(), 0L),
+                TRUE
+            );
             ShowWindow(panel.app->window, id == active ? SW_SHOWNA : SW_HIDE);
         }
     }
@@ -997,7 +1346,8 @@ struct Workspace
         SetFocus(panels.at(active).app->terminal);
     }
 
-    // Native tabs provide borders/scrolling; owner drawing reserves a distinct X area.
+    // Native tabs retain selection, keyboard navigation and overflow hit testing.
+    // Paint the full strip ourselves to avoid classic borders and use rounded Edge-style tabs.
     // Use stock GDI objects and restore the borrowed DC; no per-frame GDI allocations.
     void draw_tab(const DRAWITEMSTRUCT& item)
     {
@@ -1022,14 +1372,46 @@ struct Workspace
         {
             return;
         }
-        FillRect(
+        bool selected = !plus && (item.itemState & ODS_SELECTED);
+        RECT shape = item.rcItem;
+        shape.left += scaled(2);
+        shape.right -= scaled(2);
+        shape.top += scaled(2);
+        if (selected)
+        {
+            RECT strip{};
+            GetClientRect(tabs, &strip);
+            shape.bottom = strip.bottom;
+        }
+        SelectObject(item.hDC, GetStockObject(DC_BRUSH));
+        SelectObject(item.hDC, GetStockObject(DC_PEN));
+        COLORREF background = selected ? RGB(255, 255, 255) : RGB(232, 236, 241);
+        SetDCBrushColor(item.hDC, background);
+        SetDCPenColor(item.hDC, background);
+        RoundRect(
             item.hDC,
-            &item.rcItem,
-            GetSysColorBrush((item.itemState & ODS_SELECTED) ? COLOR_WINDOW : COLOR_BTNFACE)
+            shape.left,
+            shape.top,
+            shape.right,
+            shape.bottom,
+            scaled(12),
+            scaled(12)
         );
+        if (selected)
+        {
+            // Square off the bottom half so the active tab joins the white content.
+            RECT base{shape.left, (shape.top + shape.bottom) / 2, shape.right, shape.bottom};
+            FillRect(item.hDC, &base, static_cast<HBRUSH>(GetStockObject(DC_BRUSH)));
+        }
+        else if (!plus)
+        {
+            SetDCPenColor(item.hDC, RGB(194, 200, 208));
+            MoveToEx(item.hDC, shape.right, shape.top + scaled(9), nullptr);
+            LineTo(item.hDC, shape.right, shape.bottom - scaled(9));
+        }
         SetBkMode(item.hDC, TRANSPARENT);
         SetTextColor(item.hDC, GetSysColor(COLOR_BTNTEXT));
-        SelectObject(item.hDC, GetStockObject(DEFAULT_GUI_FONT));
+        SelectObject(item.hDC, tab_font.value);
         RECT caption = item.rcItem;
         if (plus)
         {
@@ -1075,6 +1457,49 @@ struct Workspace
         {
             RemoveWindowSubclass(h, tab_proc, 2);
             return DefSubclassProc(h, message, w, l);
+        }
+        if (message == WM_ERASEBKGND)
+        {
+            return 1;
+        }
+        if (message == WM_PAINT)
+        {
+            // BeginPaint clips to this child only. Stock objects are borrowed and
+            // the DC is restored by draw_tab; no brushes or fonts accumulate.
+            PAINTSTRUCT paint{};
+            HDC dc = BeginPaint(h, &paint);
+            RECT area{};
+            GetClientRect(h, &area);
+            SetDCBrushColor(dc, RGB(232, 236, 241));
+            FillRect(dc, &area, static_cast<HBRUSH>(GetStockObject(DC_BRUSH)));
+            for (int index = 0; index < TabCtrl_GetItemCount(h); ++index)
+            {
+                DRAWITEMSTRUCT item{};
+                item.hwndItem = h;
+                item.hDC = dc;
+                item.itemID = UINT(index);
+                item.itemState = index == TabCtrl_GetCurSel(h) ? ODS_SELECTED : 0;
+                if (TabCtrl_GetItemRect(h, index, &item.rcItem))
+                {
+                    self.draw_tab(item);
+                }
+            }
+            EndPaint(h, &paint);
+            return 0;
+        }
+        if (message == WM_NCHITTEST)
+        {
+            POINT point{SHORT(LOWORD(l)), SHORT(HIWORD(l))};
+            POINT parent_point = point;
+            ScreenToClient(self.window, &parent_point);
+            ScreenToClient(h, &point);
+            TCHITTESTINFO hit{};
+            hit.pt = point;
+            if ((!IsZoomed(self.window) && parent_point.y < self.scaled(6)) ||
+                TabCtrl_HitTest(h, &hit) < 0)
+            {
+                return HTTRANSPARENT;
+            }
         }
         if (message == WM_LBUTTONDOWN)
         {
@@ -1140,26 +1565,55 @@ struct Workspace
         }
     }
 
-    // This modal dialog is owned by the workspace; Windows frees its controls and menu resources.
-    // The modal message loop keeps existing UI timers and serial/log workers running.
+    // TaskDialog owns its controls and modal loop; serial/log workers continue.
+    // Only the fixed project URL is opened, never arbitrary notification text.
+    static HRESULT CALLBACK about_event(HWND dialog, UINT event, WPARAM, LPARAM, LONG_PTR)
+    {
+        if (event == TDN_HYPERLINK_CLICKED)
+        {
+            auto result = reinterpret_cast<INT_PTR>(ShellExecuteW(
+                dialog,
+                L"open",
+                L"https://github.com/jsjhy/serial_MCP_CPP.git",
+                nullptr,
+                nullptr,
+                SW_SHOWNORMAL
+            ));
+            if (result <= 32)
+            {
+                MessageBoxW(
+                    dialog,
+                    L"Unable to open the project link in the default browser.",
+                    L"Open project link",
+                    MB_OK | MB_ICONERROR
+                );
+            }
+        }
+        return S_OK;
+    }
+
     void about()
     {
-        MSGBOXPARAMSW parameters{};
-        parameters.cbSize = sizeof parameters;
-        parameters.hwndOwner = window;
-        parameters.hInstance = GetModuleHandleW(nullptr);
-        parameters.lpszCaption = L"About Serial Monitor C++";
-        parameters.lpszText = L"Serial Monitor C++\n"
-                              L"Version 1.0.0\n\n"
-                              L"Native WinAPI multi-port serial monitor\n"
-                              L"Up to 16 independent serial sessions\n"
-                              L"MCP: Streamable HTTP (2025-03-26)\n\n"
-                              L"https://github.com/jsjhy/serial_MCP_CPP.git";
-        parameters.dwStyle = MB_OK | MB_USERICON;
-        parameters.lpszIcon = MAKEINTRESOURCEW(IDI_APP);
-        if (!MessageBoxIndirectW(&parameters))
+        TASKDIALOGCONFIG dialog{};
+        dialog.cbSize = sizeof dialog;
+        dialog.hwndParent = window;
+        dialog.hInstance = GetModuleHandleW(nullptr);
+        dialog.dwFlags = TDF_ENABLE_HYPERLINKS | TDF_USE_HICON_MAIN | TDF_ALLOW_DIALOG_CANCELLATION;
+        dialog.dwCommonButtons = TDCBF_OK_BUTTON;
+        dialog.pszWindowTitle = L"About Serial Monitor C++";
+        dialog.pszMainInstruction = L"Serial Monitor C++";
+        // The class owns this shared icon; the dialog only borrows it.
+        dialog.hMainIcon = reinterpret_cast<HICON>(GetClassLongPtrW(window, GCLP_HICON));
+        dialog.pszContent = L"Version 1.0.0\n\n"
+                            L"Native WinAPI multi-port serial monitor\n"
+                            L"Up to 16 independent serial sessions\n"
+                            L"MCP: Streamable HTTP (2025-03-26)\n\n"
+                            L"<a href=\"https://github.com/jsjhy/serial_MCP_CPP.git\">"
+                            L"https://github.com/jsjhy/serial_MCP_CPP.git</a>";
+        dialog.pfCallback = about_event;
+        if (FAILED(TaskDialogIndirect(&dialog, nullptr, nullptr, nullptr)))
         {
-            throw std::runtime_error(win_error());
+            throw std::runtime_error("cannot create About dialog");
         }
     }
 
@@ -1178,10 +1632,93 @@ struct Workspace
         {
             return DefWindowProcW(h, message, w, l);
         }
+        if (message == WM_NCMOUSEMOVE || message == WM_NCMOUSELEAVE)
+        {
+            LRESULT next = message == WM_NCMOUSELEAVE ? HTNOWHERE : LRESULT(w);
+            self->caption_hover(next);
+            if (message == WM_NCMOUSEMOVE)
+            {
+                TRACKMOUSEEVENT tracking{sizeof tracking, TME_LEAVE | TME_NONCLIENT, h, 0};
+                TrackMouseEvent(&tracking);
+            }
+        }
+        // This client-painted caption owns its mouse messages. DWM's hidden
+        // native button geometry must not consume input for our custom row.
         try
         {
             switch (message)
             {
+                case WM_NCLBUTTONDOWN:
+                    if (w == HTMINBUTTON || w == HTMAXBUTTON || w == HTCLOSE)
+                    {
+                        self->pressed_caption = LRESULT(w);
+                        self->caption_hover(LRESULT(w));
+                        SetCapture(h);
+                        return 0;
+                    }
+                    break;
+                case WM_MOUSEMOVE:
+                    if (self->pressed_caption != HTNOWHERE)
+                    {
+                        POINT cursor{};
+                        GetCursorPos(&cursor);
+                        self->caption_hover(self->caption_hit_test(MAKELPARAM(cursor.x, cursor.y)));
+                        return 0;
+                    }
+                    break;
+                case WM_LBUTTONUP:
+                case WM_NCLBUTTONUP:
+                    if (self->pressed_caption != HTNOWHERE)
+                    {
+                        POINT cursor{};
+                        GetCursorPos(&cursor);
+                        LRESULT hit = self->caption_hit_test(MAKELPARAM(cursor.x, cursor.y));
+                        LRESULT pressed = self->pressed_caption;
+                        self->pressed_caption = HTNOWHERE;
+                        ReleaseCapture();
+                        self->caption_hover(hit);
+                        if (hit == pressed)
+                        {
+                            WPARAM command = pressed == HTCLOSE       ? SC_CLOSE
+                                             : pressed == HTMINBUTTON ? SC_MINIMIZE
+                                             : IsZoomed(h)            ? SC_RESTORE
+                                                                      : SC_MAXIMIZE;
+                            PostMessageW(h, WM_SYSCOMMAND, command, 0);
+                        }
+                        return 0;
+                    }
+                    break;
+                case WM_CAPTURECHANGED:
+                case WM_CANCELMODE:
+                    self->pressed_caption = HTNOWHERE;
+                    self->caption_hover(HTNOWHERE);
+                    break;
+                case WM_NCCALCSIZE:
+                {
+                    auto* area = w ? &reinterpret_cast<NCCALCSIZE_PARAMS*>(l)->rgrc[0]
+                                   : reinterpret_cast<RECT*>(l);
+                    if (IsZoomed(h))
+                    {
+                        // Maximized WS_THICKFRAME windows extend their invisible resize border
+                        // beyond the work area; keep the client row inside that work area.
+                        UINT dpi = GetDpiForWindow(h);
+                        int x = GetSystemMetricsForDpi(SM_CXSIZEFRAME, dpi) +
+                                GetSystemMetricsForDpi(SM_CXPADDEDBORDER, dpi);
+                        int y = GetSystemMetricsForDpi(SM_CYSIZEFRAME, dpi) +
+                                GetSystemMetricsForDpi(SM_CXPADDEDBORDER, dpi);
+                        InflateRect(area, -x, -y);
+                    }
+                    return 0;
+                }
+                case WM_NCHITTEST:
+                    return self->caption_hit_test(l);
+                case WM_ACTIVATE:
+                case WM_DWMCOMPOSITIONCHANGED:
+                    self->caption_frame();
+                    break;
+                case WM_PAINT:
+                    self->paint_caption();
+                    return 0;
                 case WM_SYSCOMMAND:
                     if ((w & 0xFFF0) == IDM_ABOUT)
                     {
@@ -1193,8 +1730,14 @@ struct Workspace
                     reinterpret_cast<MINMAXINFO*>(l)->ptMinTrackSize = {1100, 540};
                     return 0;
                 case WM_SIZE:
+                {
                     self->layout();
+                    RECT row{};
+                    GetClientRect(h, &row);
+                    row.bottom = self->header_height();
+                    InvalidateRect(h, &row, FALSE);
                     return 0;
+                }
                 case WM_TIMER:
                     if (self->restart.ready())
                     {
@@ -1281,7 +1824,7 @@ struct Workspace
             0,
             WC_TABCONTROLW,
             L"",
-            WS_CHILD | WS_VISIBLE | TCS_SINGLELINE | TCS_OWNERDRAWFIXED,
+            WS_CHILD | WS_VISIBLE | TCS_SINGLELINE | TCS_OWNERDRAWFIXED | TCS_FLATBUTTONS,
             0,
             0,
             100,
@@ -1295,15 +1838,41 @@ struct Workspace
         {
             throw std::runtime_error("tab control initialization failed");
         }
-        SendMessageW(
-            tabs,
-            WM_SETFONT,
-            reinterpret_cast<WPARAM>(GetStockObject(DEFAULT_GUI_FONT)),
-            0
+        tab_font.value = CreateFontW(
+            -scaled(13),
+            0,
+            0,
+            0,
+            FW_NORMAL,
+            FALSE,
+            FALSE,
+            FALSE,
+            DEFAULT_CHARSET,
+            0,
+            0,
+            CLEARTYPE_QUALITY,
+            0,
+            L"Segoe UI"
+        );
+        if (!tab_font.value)
+        {
+            throw std::runtime_error("tab font initialization failed");
+        }
+        SendMessageW(tabs, WM_SETFONT, reinterpret_cast<WPARAM>(tab_font.value), FALSE);
+        TabCtrl_SetItemSize(tabs, scaled(200), scaled(32));
+        window_frame(window);
+        caption_frame();
+        SetWindowPos(
+            window,
+            nullptr,
+            0,
+            0,
+            0,
+            0,
+            SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE | SWP_FRAMECHANGED
         );
         sync();
         SetTimer(window, 2, 250, nullptr);
-        window_frame(window);
         if (visible)
         {
             ShowWindow(window, SW_SHOW);
@@ -1336,6 +1905,182 @@ int gui(SessionManager& sessions, Restart& restart, Config config)
     return 0;
 }
 
+// Synthetic RX enters Core::publish and real log/UI paths, but never opens a serial device.
+// Repeated samples distinguish queue warm-up/allocator retention from sustained resource growth.
+int receive_stress_test()
+{
+    auto temporary = fs::weakly_canonical(fs::temp_directory_path());
+    auto directory =
+        temporary / (L"serial_receive_stress_" + std::to_wstring(GetCurrentProcessId()) + L"_" +
+                        std::to_wstring(GetTickCount64()));
+    // Cleanup may recurse only into a fresh, verified direct child of the temporary directory.
+    if (fs::weakly_canonical(directory).parent_path() != temporary ||
+        !fs::create_directory(directory))
+    {
+        throw std::runtime_error("could not create an isolated stress log directory");
+    }
+    Config config;
+    config.log_dir = directory;
+    config.keep_days = 0;
+    config.rotate = 64 * 1024 * 1024;
+    SessionManager manager(config);
+    manager.create();
+    manager.create();
+    auto sessions = manager.list();
+    Restart restart({executable().wstring()});
+    unsigned duration = 18;
+    wchar_t requested[32]{};
+    if (GetEnvironmentVariableW(L"SERIAL_MCP_STRESS_SECONDS", requested, 32))
+    {
+        duration = unsigned(std::clamp(std::stoul(requested), 5UL, 300UL));
+    }
+    std::atomic<bool> stop = false;
+    std::atomic<uint64_t> injected = 0;
+    std::thread producer;
+    double worst = 0;
+    {
+        Workspace workspace(manager, restart, config);
+        workspace.create(true);
+        std::string payload;
+        while (payload.size() < 4096)
+        {
+            payload += "\x1b[32m[load] ";
+            payload += std::string(72, 'x');
+            payload += " 中文😀\x1b[0m\r\n";
+        }
+        payload.resize(4096);
+        producer = std::thread(
+            [&]
+            {
+                while (!stop)
+                {
+                    for (auto& session : sessions)
+                    {
+                        if (stop)
+                        {
+                            break;
+                        }
+                        session->core.publish(Direction::Rx, payload);
+                        injected += payload.size();
+                    }
+                    std::this_thread::sleep_for(std::chrono::milliseconds(2));
+                }
+            }
+        );
+        auto start = Clock::now();
+        auto next = start;
+        try
+        {
+            while (Clock::now() - start < std::chrono::seconds(duration))
+            {
+                if (Clock::now() - start >= std::chrono::seconds(duration / 2))
+                {
+                    auto& page = *workspace.panels.at(workspace.active).app;
+                    if (!page.hex)
+                    {
+                        page.hex = true;
+                        page.display.reset();
+                        page.apply({0, {{L"\r", page.palette.fg}}});
+                    }
+                }
+                auto began = Clock::now();
+                MSG message{};
+                // Dispatch one message before rechecking deadlines; a busy queue cannot starve cleanup.
+                if (PeekMessageW(&message, nullptr, 0, 0, PM_REMOVE))
+                {
+                    if (message.message == WM_QUIT)
+                    {
+                        break;
+                    }
+                    TranslateMessage(&message);
+                    DispatchMessageW(&message);
+                }
+                else
+                {
+                    std::this_thread::sleep_for(std::chrono::milliseconds(1));
+                }
+                worst = std::max(
+                    worst,
+                    std::chrono::duration<double, std::milli>(Clock::now() - began).count()
+                );
+                if (Clock::now() >= next)
+                {
+                    PROCESS_MEMORY_COUNTERS_EX memory{};
+                    memory.cb = sizeof memory;
+                    K32GetProcessMemoryInfo(
+                        GetCurrentProcess(),
+                        reinterpret_cast<PROCESS_MEMORY_COUNTERS*>(&memory),
+                        sizeof memory
+                    );
+                    unsigned threads = 0;
+                    {
+                        Handle snapshot(CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0));
+                        THREADENTRY32 entry{};
+                        entry.dwSize = sizeof entry;
+                        if (snapshot && Thread32First(snapshot.value, &entry))
+                        {
+                            do
+                            {
+                                if (entry.th32OwnerProcessID == GetCurrentProcessId())
+                                {
+                                    ++threads;
+                                }
+                            } while (Thread32Next(snapshot.value, &entry));
+                        }
+                    }
+                    DWORD handles = 0;
+                    GetProcessHandleCount(GetCurrentProcess(), &handles);
+                    std::printf(
+                        "RX_STRESS seconds=%.1f injected=%llu private=%llu working=%llu handles=%lu gdi=%lu user=%lu worst_message_ms=%.2f threads=%u mode=%s\n",
+                        std::chrono::duration<double>(Clock::now() - start).count(),
+                        static_cast<unsigned long long>(injected.load()),
+                        static_cast<unsigned long long>(memory.PrivateUsage),
+                        static_cast<unsigned long long>(memory.WorkingSetSize),
+                        handles,
+                        GetGuiResources(GetCurrentProcess(), GR_GDIOBJECTS),
+                        GetGuiResources(GetCurrentProcess(), GR_USEROBJECTS),
+                        worst,
+                        threads,
+                        workspace.panels.at(workspace.active).app->hex ? "hex" : "ascii"
+                    );
+                    std::fflush(stdout);
+                    next = Clock::now() + std::chrono::seconds(1);
+                }
+            }
+        }
+        catch (...)
+        {
+            stop = true;
+            manager.release_producers();
+            producer.join();
+            manager.stop();
+            throw;
+        }
+        stop = true;
+        manager.release_producers();
+        producer.join();
+        manager.stop();
+        for (auto& session : sessions)
+        {
+            if (!session->log.error().empty())
+            {
+                throw std::runtime_error(session->log.error());
+            }
+        }
+    }
+    MSG message{};
+    while (PeekMessageW(&message, nullptr, WM_QUIT, WM_QUIT, PM_REMOVE))
+    {
+    }
+    fs::remove_all(directory);
+    std::printf(
+        "RX_STRESS complete injected=%llu worst_message_ms=%.2f; synthetic data, not real serial or a long-run leak proof\n",
+        static_cast<unsigned long long>(injected.load()),
+        worst
+    );
+    return 0;
+}
+
 void native_tests(Core& core, LogWriter& log, Restart& restart)
 {
     auto require = [](bool ok, const char* s)
@@ -1354,6 +2099,19 @@ void native_tests(Core& core, LogWriter& log, Restart& restart)
         {
             Workspace workspace(manager, restart, config);
             workspace.create(false);
+            RECT outer{}, client{}, tab_bounds{};
+            GetWindowRect(workspace.window, &outer);
+            GetClientRect(workspace.window, &client);
+            GetWindowRect(workspace.tabs, &tab_bounds);
+            POINT tab_origin{tab_bounds.left, tab_bounds.top};
+            ScreenToClient(workspace.window, &tab_origin);
+            require(client.bottom == outer.bottom - outer.top, "caption uses the client row");
+            require(tab_origin.y < workspace.header_height(), "tabs share the caption row");
+            POINT drag{outer.right - workspace.scaled(175), outer.top + workspace.scaled(20)};
+            require(
+                workspace.caption_hit_test(MAKELPARAM(drag.x, drag.y)) == HTCAPTION,
+                "compact caption preserves window dragging"
+            );
             auto& a = *workspace.panels.at(first->id).app;
             auto& b = *workspace.panels.at(second->id).app;
             a.draft(L"draft A中文");
@@ -1435,6 +2193,16 @@ void native_tests(Core& core, LogWriter& log, Restart& restart)
             require(a.hex, "mode button");
             a.command(EOL);
             require(a.eol == "none", "line ending button");
+            a.clear();
+            Patch batch;
+            batch.append(a.display.feed({Direction::Rx, "\\rtf1{literal}中", stamp()}, false));
+            batch.append(a.display.feed({Direction::Rx, "😀\nnext", stamp()}, false));
+            a.apply(std::move(batch));
+            require(a.draft() == L"help中文😀", "RTF batch preserves the input draft");
+            require(
+                rich_text(a.terminal).find(L"\\rtf1{literal}中😀") != std::wstring::npos,
+                "RTF batch escapes device syntax and preserves UTF-16"
+            );
         }
         // App destroys the window; remove the test thread's WM_QUIT before the next cycle.
     };

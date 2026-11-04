@@ -3,6 +3,34 @@
 
 namespace sm
 {
+void Patch::append(Patch next)
+{
+    long remaining = next.erase;
+    while (remaining > 0 && !pieces.empty())
+    {
+        auto& tail = pieces.back().text;
+        long removed = std::min(remaining, long(tail.size()));
+        tail.resize(tail.size() - size_t(removed));
+        remaining -= removed;
+        if (tail.empty())
+        {
+            pieces.pop_back();
+        }
+    }
+    erase += remaining;
+    for (auto& piece : next.pieces)
+    {
+        if (!pieces.empty() && pieces.back().color == piece.color)
+        {
+            pieces.back().text += piece.text;
+        }
+        else
+        {
+            pieces.push_back(std::move(piece));
+        }
+    }
+}
+
 void TextParser::sgr()
 {
     std::vector<int> p;
@@ -70,8 +98,29 @@ void TextParser::finish(const Emit& emit)
 
 void TextParser::feed(const std::string& bytes, const Emit& emit)
 {
-    for (unsigned char b : bytes)
+    for (size_t offset = 0; offset < bytes.size(); ++offset)
     {
+        unsigned char b = static_cast<unsigned char>(bytes[offset]);
+        // Common log traffic is printable ASCII. Emit bounded runs instead of allocating and
+        // converting one UTF-16/UTF-8 string per byte. Controls/UTF-8/ANSI keep the slow path.
+        if (!escape_ && utf_.empty() && b >= 32 && b < 127)
+        {
+            size_t end = offset + 1;
+            size_t limit = std::min(bytes.size(), offset + 512);
+            while (end < limit)
+            {
+                auto next = static_cast<unsigned char>(bytes[end]);
+                if (next < 32 || next >= 127)
+                {
+                    break;
+                }
+                ++end;
+            }
+            cr_ = false;
+            emit(std::wstring(bytes.begin() + offset, bytes.begin() + end), fg_);
+            offset = end - 1;
+            continue;
+        }
         if (escape_)
         {
             if (sequence_.size() > 4096)

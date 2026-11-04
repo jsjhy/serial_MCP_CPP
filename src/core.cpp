@@ -200,8 +200,14 @@ void LogWriter::loop()
             // Bound formatted data on disk failure; retain pending output and retry so backpressure reaches producers.
             if (pending.size() < queue_limit_)
             {
+                size_t batch_bytes = 0;
                 for (unsigned i = 0; i < 64 && !queue_.empty(); ++i)
                 {
+                    if (!batch.empty() && batch_bytes + queue_.front().data.size() > 256 * 1024)
+                    {
+                        break;
+                    }
+                    batch_bytes += queue_.front().data.size();
                     bytes_ -= queue_.front().data.size();
                     batch.push_back(std::move(queue_.front()));
                     queue_.pop_front();
@@ -337,18 +343,30 @@ void Core::publish(Direction dir, std::string bytes)
     {
         event_bytes_ -= events_.front().data.size();
         events_.pop_front();
+        ++state_.display_dropped;
     }
 }
 
-std::vector<Record> Core::drain(size_t n)
+std::vector<Record> Core::drain(size_t count, size_t byte_limit)
 {
     std::lock_guard lock(mutex_);
     std::vector<Record> out;
-    while (n-- && !events_.empty())
+    while (count-- && byte_limit && !events_.empty())
     {
-        event_bytes_ -= events_.front().data.size();
-        out.push_back(std::move(events_.front()));
-        events_.pop_front();
+        auto& front = events_.front();
+        size_t take = std::min(byte_limit, front.data.size());
+        event_bytes_ -= take;
+        byte_limit -= take;
+        if (take == front.data.size())
+        {
+            out.push_back(std::move(front));
+            events_.pop_front();
+        }
+        else
+        {
+            out.push_back({front.dir, front.data.substr(0, take), front.time});
+            front.data.erase(0, take);
+        }
     }
     return out;
 }

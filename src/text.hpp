@@ -29,6 +29,8 @@ struct Patch
 {
     long erase = 0;
     std::vector<Piece> pieces;
+    // Compose sequential replacements, canceling partial-line snapshots inside this batch.
+    void append(Patch next);
 };
 
 class TextParser
