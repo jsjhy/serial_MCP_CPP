@@ -19,6 +19,8 @@ constexpr int MODE = 106;
 constexpr int EOL = 107;
 constexpr int CLEAR = 108;
 constexpr int TERM = 109;
+constexpr int FILTER_APPLY = 110;
+constexpr int FILTER_ENABLE = 113;
 
 std::wstring get_text(HWND h)
 {
@@ -180,6 +182,11 @@ struct App
     Font mono;
     HWND window = nullptr;
     HWND terminal = nullptr;
+    HWND filter_text = nullptr;
+    HWND filter_mode = nullptr;
+    HWND filter_apply = nullptr;
+    HWND filter_enable = nullptr;
+    bool filter_enabled = true; // GUI-thread state; toggling retains the applied predicate.
     HWND port = nullptr;
     HWND baud = nullptr;
     HWND status = nullptr;
@@ -304,6 +311,21 @@ struct App
         {
             buttons.emplace_back(id, control(L"BUTTON", name, BS_PUSHBUTTON | WS_TABSTOP, id));
         }
+        filter_enable = control(L"BUTTON", L"Enable", BS_AUTOCHECKBOX | WS_TABSTOP, FILTER_ENABLE);
+        SendMessageW(filter_enable, BM_SETCHECK, BST_CHECKED, 0);
+        filter_mode = control(L"COMBOBOX", L"", CBS_DROPDOWNLIST | WS_TABSTOP, 111);
+        SendMessageW(filter_mode, CB_ADDSTRING, 0, reinterpret_cast<LPARAM>(L"Include"));
+        SendMessageW(filter_mode, CB_ADDSTRING, 0, reinterpret_cast<LPARAM>(L"Exclude"));
+        SendMessageW(filter_mode, CB_SETCURSEL, 0, 0);
+        filter_text = control(L"EDIT", L"", WS_BORDER | ES_AUTOHSCROLL | WS_TABSTOP, 112);
+        SendMessageW(filter_text, EM_SETLIMITTEXT, 256, 0);
+        SendMessageW(
+            filter_text,
+            EM_SETCUEBANNER,
+            TRUE,
+            reinterpret_cast<LPARAM>(L"Display filter (empty = all)")
+        );
+        filter_apply = control(L"BUTTON", L"Apply", BS_PUSHBUTTON | WS_TABSTOP, FILTER_APPLY);
         status = control(L"STATIC", L"", SS_LEFTNOWORDWRAP, 0);
         log_status = control(L"STATIC", L"", SS_LEFTNOWORDWRAP, 0);
         mcp = control(L"STATIC", L"", SS_LEFTNOWORDWRAP, 0);
@@ -349,7 +371,11 @@ struct App
         }
         MoveWindow(status, 12, 50, w - 24, 24, TRUE);
         MoveWindow(log_status, 12, 76, w - 24, 24, TRUE);
-        MoveWindow(terminal, 12, 106, w - 24, std::max(h - 148, 20), TRUE);
+        MoveWindow(filter_enable, 12, 104, 80, 26, TRUE);
+        MoveWindow(filter_mode, 102, 104, 104, 180, TRUE);
+        MoveWindow(filter_text, 216, 104, std::max(w - 326, 40), 26, TRUE);
+        MoveWindow(filter_apply, w - 100, 104, 88, 26, TRUE);
+        MoveWindow(terminal, 12, 140, w - 24, std::max(h - 182, 20), TRUE);
         MoveWindow(mcp, 12, h - 32, w - 24, 24, TRUE);
     }
 
@@ -553,7 +579,15 @@ struct App
         long remove = std::min(old, patch.erase);
         select(terminal, old - remove, old);
         boundary -= remove;
-        insert_pieces(patch.pieces);
+        // A partial row may become hidden without producing any replacement text.
+        if (patch.pieces.empty())
+        {
+            SendMessageW(terminal, EM_REPLACESEL, FALSE, reinterpret_cast<LPARAM>(L""));
+        }
+        else
+        {
+            insert_pieces(patch.pieces);
+        }
         for (auto& piece : patch.pieces)
         {
             boundary += long(piece.text.size());
@@ -646,7 +680,28 @@ struct App
     {
         try
         {
-            if (id == CONNECTION)
+            if (id == FILTER_ENABLE)
+            {
+                filter_enabled = SendMessageW(filter_enable, BM_GETCHECK, 0, 0) == BST_CHECKED;
+                clear();
+            }
+            else if (id == FILTER_APPLY)
+            {
+                auto pattern = get_text(filter_text);
+                bool exclude = SendMessageW(filter_mode, CB_GETCURSEL, 0, 0) == 1;
+                // Predicate and parser belong to this GUI page and never touch persisted records.
+                display.visible = [this, pattern, exclude](const std::wstring& body)
+                {
+                    if (!filter_enabled || pattern.empty())
+                    {
+                        return true;
+                    }
+                    bool match = body.find(pattern) != std::wstring::npos;
+                    return exclude ? !match : match;
+                };
+                clear();
+            }
+            else if (id == CONNECTION)
             {
                 if (connection_job)
                 {
@@ -2202,6 +2257,17 @@ void native_tests(Core& core, LogWriter& log, Restart& restart)
             require(
                 rich_text(a.terminal).find(L"\\rtf1{literal}中😀") != std::wstring::npos,
                 "RTF batch escapes device syntax and preserves UTF-16"
+            );
+            a.clear();
+            a.display.visible = [](const std::wstring& row)
+            {
+                return row.find(L"hide") == std::wstring::npos;
+            };
+            a.apply(a.display.feed({Direction::Rx, "partial ", stamp()}, false));
+            a.apply(a.display.feed({Direction::Rx, "hide\n", stamp()}, false));
+            require(
+                a.boundary == 0 && rich_text(a.terminal) == a.draft() && a.draft() == L"help中文😀",
+                "erase-only filter patch removes the stale last row"
             );
         }
         // App destroys the window; remove the test thread's WM_QUIT before the next cycle.

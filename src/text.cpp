@@ -265,14 +265,28 @@ Patch Display::feed(const Record& rec, bool hex)
             add(widen("[" + time_ + "] "), palette_.dim);
         }
     };
+    auto matches = [&]
+    {
+        std::wstring body;
+        for (size_t i = 0; i < line_.size(); ++i)
+        {
+            body += line_[i].text;
+        }
+        auto prefix_size = widen("[" + time_ + "] ").size();
+        body.erase(0, std::min(prefix_size, body.size()));
+        return !visible || visible(body);
+    };
     auto finish_line = [&]
     {
         prefix();
-        for (auto& p : line_)
+        if (matches())
         {
-            out.pieces.push_back(std::move(p));
+            for (auto& p : line_)
+            {
+                out.pieces.push_back(std::move(p));
+            }
+            out.pieces.push_back({L"\r", palette_.fg});
         }
-        out.pieces.push_back({L"\r", palette_.fg});
         line_.clear();
         time_.clear();
         body_ = 0;
@@ -370,10 +384,13 @@ Patch Display::feed(const Record& rec, bool hex)
         finish_line();
     }
     previous_ = 0;
-    for (auto& p : line_)
+    if (matches())
     {
-        out.pieces.push_back(p);
-        previous_ += long(p.text.size());
+        for (auto& p : line_)
+        {
+            out.pieces.push_back(p);
+            previous_ += long(p.text.size());
+        }
     }
     return out;
 }

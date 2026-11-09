@@ -53,6 +53,26 @@ int self_test()
     check(decode_escapes("help\\r\\n") == "help\r\n", "ASCII escape decoding");
     check(utf8(widen("中文😀")) == "中文😀", "UTF-8 round trip");
     Palette palette("dark");
+    Display filtered(palette);
+    filtered.visible = [](const std::wstring& body)
+    {
+        return body.find(L"ERROR") != std::wstring::npos;
+    };
+    auto hidden = filtered.feed({Direction::Rx, "noise\nER", "12:00"}, false);
+    check(hidden.pieces.empty(), "filter hides nonmatching complete and partial lines");
+    auto shown = filtered.feed({Direction::Rx, "ROR\x1b[31m detail", "12:01"}, false);
+    check(!shown.pieces.empty(), "filter matches decoded line across packets");
+    auto removed = filtered.feed({Direction::Rx, "\nnoise\n", "12:02"}, false);
+    check(removed.erase > 0, "filtered partial snapshot is replaced on completion");
+    filtered.visible = [](const std::wstring& body)
+    {
+        return body.find(L"noise") == std::wstring::npos;
+    };
+    filtered.reset();
+    check(
+        filtered.feed({Direction::Rx, "noise\n", "12:03"}, false).pieces.empty(),
+        "exclude predicate survives parser reset"
+    );
     Display display(palette);
     auto first = display.feed({Direction::Rx, "中😀", "12:34:56.789"}, false);
     long size = 0;

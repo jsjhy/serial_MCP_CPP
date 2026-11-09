@@ -73,6 +73,8 @@ public:
     {
     }
 
+    // UI-owned predicate receives decoded line bodies without timestamps.
+    std::function<bool(const std::wstring&)> visible;
     Patch feed(const Record& record, bool hex);
 
     void reset()

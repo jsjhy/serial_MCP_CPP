@@ -2,6 +2,10 @@
 
 独立 C++20 复刻，使用 WinAPI、RichEdit、Windows 串口重叠 I/O 和 Winsock，不依赖 Rust、Qt、WebView 或第三方运行时。所有源文件在 src；仅保留 GUI/MCP，不再构建 TUI。GUI 没有自定义功能快捷键。
 
+## 学习文档
+
+[C++ 初学者项目讲解](CPP_BEGINNER_GUIDE.md)：程序入口、模块与数据流、串口收发、多线程、资源管理、GUI/MCP 及阅读练习。
+
 ## 构建与发布
 
 **构建直接使用 CMake 3.21+，不再额外包装构建脚本。** Windows 需要 MinGW-w64 或 MSVC：
@@ -94,3 +98,7 @@ Python 脚本均从自身位置定位项目，可从任意工作目录调用；`
 2026-11-03 的修复前后测量与限制见项目根目录 `RECEIVE_PERFORMANCE.md`。
 
 About 对话框中的 GitHub 项目地址为可点击超链接，使用系统默认浏览器打开；打开失败时显示错误提示。
+
+## Display filtering
+
+Each tab has an independent Include / Exclude keyword filter. Enable is checked by default; toggling it immediately enables or bypasses the applied filter, clears the current display while preserving the draft, and retains the keyword and mode. Editing the keyword or mode still requires Apply. Matching is case-sensitive literal text, without regular expressions. Click Apply to clear the display (draft preserved) and filter subsequently consumed display records; history is not replayed. Empty keywords show all rows. Matching uses decoded ASCII line bodies without timestamps, or HEX rows; partial lines are reevaluated as bytes arrive and removed from view if they stop matching. Existing 16 Ki UTF-16 line segmentation remains. TX rows are also filtered. Logs and MCP history are unchanged. Filters are not persisted.
