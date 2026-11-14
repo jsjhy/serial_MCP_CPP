@@ -63,6 +63,7 @@ class Display
     std::vector<Piece> line_;
     long previous_ = 0;
     long body_ = 0;
+    bool oversized_ = false;
     std::string time_;
     void add(const std::wstring& text, COLORREF color);
 
@@ -77,12 +78,15 @@ public:
     std::function<bool(const std::wstring&)> visible;
     Patch feed(const Record& record, bool hex);
 
-    void reset()
+    long reset()
     {
+        const long erased = previous_;
         line_.clear();
+        oversized_ = false;
         previous_ = body_ = 0;
         time_.clear();
         parser_ = TextParser(palette_.fg);
+        return erased;
     }
 };
 } // namespace sm

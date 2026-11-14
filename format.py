@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Cross-platform C++ formatter using the project-local clang-format first, then PATH.
 
-Only src C++ files are processed. --check is read-only; failures return nonzero.
+Only src and tests C++ files are processed. --check is read-only; failures return nonzero.
 The script neither installs tools nor changes application behavior or log formats."""
 
 import argparse
@@ -26,7 +26,8 @@ def main():
     formatter = args.formatter or (str(local) if local.is_file() else shutil.which("clang-format"))
     if not formatter:
         parser.error("Install clang-format==23.1.3 or pass --formatter PATH")
-    sources = sorted(path for path in (ROOT / "src").rglob("*")
+    sources = sorted(path for directory in ("src", "tests")
+                     for path in (ROOT / directory).rglob("*")
                      if path.suffix in (".cpp", ".hpp", ".h"))
     if not sources:
         raise RuntimeError("No C++ sources found")

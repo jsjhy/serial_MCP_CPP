@@ -267,6 +267,10 @@ Patch Display::feed(const Record& rec, bool hex)
     };
     auto matches = [&]
     {
+        if (!visible)
+        {
+            return true;
+        }
         std::wstring body;
         for (size_t i = 0; i < line_.size(); ++i)
         {
@@ -274,7 +278,7 @@ Patch Display::feed(const Record& rec, bool hex)
         }
         auto prefix_size = widen("[" + time_ + "] ").size();
         body.erase(0, std::min(prefix_size, body.size()));
-        return !visible || visible(body);
+        return visible(body);
     };
     auto finish_line = [&]
     {
@@ -299,7 +303,18 @@ Patch Display::feed(const Record& rec, bool hex)
             {
                 if (s == L"\r")
                 {
-                    finish_line();
+                    if (oversized_)
+                    {
+                        oversized_ = false;
+                    }
+                    else
+                    {
+                        finish_line();
+                    }
+                    return;
+                }
+                if (oversized_)
+                {
                     return;
                 }
                 if (s == L"\b")
@@ -322,7 +337,16 @@ Patch Display::feed(const Record& rec, bool hex)
                     return;
                 }
                 prefix();
-                if (body_ > 16384)
+                // Keep logical rows together for matching, with a hard bound for streams without LF.
+                if (visible && body_ + long(s.size()) > 256 * 1024)
+                {
+                    oversized_ = true;
+                    line_.clear();
+                    time_.clear();
+                    body_ = 0;
+                    return;
+                }
+                if (!visible && body_ > 16384)
                 {
                     finish_line();
                 }

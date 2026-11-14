@@ -1,10 +1,12 @@
 // WinAPI GUI: the UI thread owns windows, fonts and UTF-16 selections. Serial actions use Core's task queue.
-// RX patches precede the draft. Selecting history pauses display updates, not file logging. No custom shortcuts.
+// RX patches precede the draft. Incoming output scrolls to the bottom. No custom shortcuts.
 #include "ui.hpp"
 #include "resource.h"
 #include <cassert>
+#include <commdlg.h>
 #include <psapi.h>
 #include <cstring>
+#include <fstream>
 #include <tlhelp32.h>
 
 namespace sm
@@ -15,12 +17,16 @@ constexpr int PORT = 101;
 constexpr int BAUD = 102;
 constexpr int CONNECTION = 103;
 constexpr int REFRESH = 105;
-constexpr int MODE = 106;
 constexpr int EOL = 107;
 constexpr int CLEAR = 108;
 constexpr int TERM = 109;
 constexpr int FILTER_APPLY = 110;
 constexpr int FILTER_ENABLE = 113;
+constexpr int FIND_NEXT = 114;
+constexpr int LOG_TOGGLE = 120;
+constexpr int LOG_RELOAD = 121;
+constexpr int LOG_MATCH_CASE = 122;
+constexpr int FIND_PREVIOUS = 116;
 
 std::wstring get_text(HWND h)
 {
@@ -182,10 +188,21 @@ struct App
     Font mono;
     HWND window = nullptr;
     HWND terminal = nullptr;
-    HWND filter_text = nullptr;
-    HWND filter_mode = nullptr;
+    HWND archive = nullptr;
+    HWND archive_toggle = nullptr;
+    HWND archive_reload = nullptr;
+    HWND archive_match_case = nullptr;
+    bool archive_open = false;
+    std::optional<std::future<std::wstring>> archive_job;
+    HWND include_text = nullptr;
+    HWND exclude_text = nullptr;
     HWND filter_apply = nullptr;
+    HWND search = nullptr;
+    HWND find_next = nullptr;
+    HWND find_previous = nullptr;
     HWND filter_enable = nullptr;
+    std::wstring applied_include;
+    std::wstring applied_exclude;
     bool filter_enabled = true; // GUI-thread state; toggling retains the applied predicate.
     HWND port = nullptr;
     HWND baud = nullptr;
@@ -202,7 +219,6 @@ struct App
     uint64_t last_display_dropped = 0;
     std::vector<std::pair<std::future<std::string>, bool>> jobs;
     uint64_t scan = 0;
-    bool hex;
     std::string eol;
 
     App(Core& c, LogWriter& l, Restart& r, Config cfg, std::string id = {})
@@ -213,7 +229,6 @@ struct App
           config(std::move(cfg)),
           palette(config.theme),
           display(palette),
-          hex(config.hex),
           eol(config.eol)
     {
     }
@@ -305,7 +320,6 @@ struct App
         text(baud, std::to_wstring(s.baud));
         for (auto [id, name] : std::vector<std::pair<int, const wchar_t*>>{{CONNECTION, L"Connect"},
                  {REFRESH, L"Refresh"},
-                 {MODE, L"ASCII"},
                  {EOL, L"EOL: CRLF"},
                  {CLEAR, L"Clear"}})
         {
@@ -313,19 +327,20 @@ struct App
         }
         filter_enable = control(L"BUTTON", L"Enable", BS_AUTOCHECKBOX | WS_TABSTOP, FILTER_ENABLE);
         SendMessageW(filter_enable, BM_SETCHECK, BST_CHECKED, 0);
-        filter_mode = control(L"COMBOBOX", L"", CBS_DROPDOWNLIST | WS_TABSTOP, 111);
-        SendMessageW(filter_mode, CB_ADDSTRING, 0, reinterpret_cast<LPARAM>(L"Include"));
-        SendMessageW(filter_mode, CB_ADDSTRING, 0, reinterpret_cast<LPARAM>(L"Exclude"));
-        SendMessageW(filter_mode, CB_SETCURSEL, 0, 0);
-        filter_text = control(L"EDIT", L"", WS_BORDER | ES_AUTOHSCROLL | WS_TABSTOP, 112);
-        SendMessageW(filter_text, EM_SETLIMITTEXT, 256, 0);
-        SendMessageW(
-            filter_text,
-            EM_SETCUEBANNER,
-            TRUE,
-            reinterpret_cast<LPARAM>(L"Display filter (empty = all)")
-        );
+        include_text = control(L"EDIT", L"", WS_BORDER | ES_AUTOHSCROLL | WS_TABSTOP, 112);
+        exclude_text = control(L"EDIT", L"", WS_BORDER | ES_AUTOHSCROLL | WS_TABSTOP, 111);
+        for (const auto& [edit, hint] :
+            {std::pair{include_text, L"Include"}, std::pair{exclude_text, L"Exclude"}})
+        {
+            SendMessageW(edit, EM_SETLIMITTEXT, 256, 0);
+            SendMessageW(edit, EM_SETCUEBANNER, TRUE, reinterpret_cast<LPARAM>(hint));
+        }
         filter_apply = control(L"BUTTON", L"Apply", BS_PUSHBUTTON | WS_TABSTOP, FILTER_APPLY);
+        search = control(L"EDIT", L"", WS_BORDER | ES_AUTOHSCROLL | WS_TABSTOP, 115);
+        SendMessageW(search, EM_SETLIMITTEXT, 256, 0);
+        SendMessageW(search, EM_SETCUEBANNER, TRUE, reinterpret_cast<LPARAM>(L"Search log"));
+        find_previous = control(L"BUTTON", L"Previous", BS_PUSHBUTTON | WS_TABSTOP, FIND_PREVIOUS);
+        find_next = control(L"BUTTON", L"Next", BS_PUSHBUTTON | WS_TABSTOP, FIND_NEXT);
         status = control(L"STATIC", L"", SS_LEFTNOWORDWRAP, 0);
         log_status = control(L"STATIC", L"", SS_LEFTNOWORDWRAP, 0);
         mcp = control(L"STATIC", L"", SS_LEFTNOWORDWRAP, 0);
@@ -345,6 +360,32 @@ struct App
         {
             throw std::runtime_error("RichEdit subclass failed");
         }
+        archive_toggle = control(L"BUTTON", L">", BS_PUSHBUTTON | WS_TABSTOP, LOG_TOGGLE);
+        archive_reload = control(L"BUTTON", L"Reload log", BS_PUSHBUTTON | WS_TABSTOP, LOG_RELOAD);
+        archive_match_case =
+            control(L"BUTTON", L"Match case", BS_AUTOCHECKBOX | WS_TABSTOP, LOG_MATCH_CASE);
+        SendMessageW(archive_match_case, BM_SETCHECK, BST_CHECKED, 0);
+        archive = control(
+            MSFTEDIT_CLASS,
+            L"",
+            ES_MULTILINE | ES_READONLY | ES_NOHIDESEL | ES_AUTOHSCROLL | WS_VSCROLL | WS_HSCROLL |
+                WS_TABSTOP,
+            0
+        );
+        SendMessageW(archive, WM_SETFONT, reinterpret_cast<WPARAM>(mono.value), 0);
+        SendMessageW(archive, EM_EXLIMITTEXT, 0, LONG_MAX);
+        SendMessageW(archive, EM_SETTARGETDEVICE, 0, 1);
+        SendMessageW(archive, EM_SETBKGNDCOLOR, 0, palette.bg);
+        CHARFORMATW archive_format{};
+        archive_format.cbSize = sizeof archive_format;
+        archive_format.dwMask = CFM_COLOR;
+        archive_format.crTextColor = palette.fg;
+        SendMessageW(
+            archive,
+            EM_SETCHARFORMAT,
+            SCF_DEFAULT,
+            reinterpret_cast<LPARAM>(&archive_format)
+        );
         SetTimer(window, 1, 33, nullptr);
         layout();
         scan_ports();
@@ -371,11 +412,43 @@ struct App
         }
         MoveWindow(status, 12, 50, w - 24, 24, TRUE);
         MoveWindow(log_status, 12, 76, w - 24, 24, TRUE);
-        MoveWindow(filter_enable, 12, 104, 80, 26, TRUE);
-        MoveWindow(filter_mode, 102, 104, 104, 180, TRUE);
-        MoveWindow(filter_text, 216, 104, std::max(w - 326, 40), 26, TRUE);
-        MoveWindow(filter_apply, w - 100, 104, 88, 26, TRUE);
-        MoveWindow(terminal, 12, 140, w - 24, std::max(h - 182, 20), TRUE);
+        const int top = 104;
+        const int panel = archive_open ? w / 2 : w - 12;
+        const int left = panel + 4;
+        const int right = w - 12;
+        MoveWindow(terminal, 12, top, std::max(panel - 46, 20), std::max(h - top - 42, 20), TRUE);
+        MoveWindow(archive_toggle, panel - 30, top, 26, 26, TRUE);
+        MoveWindow(archive_reload, left, top, 104, 26, TRUE);
+        MoveWindow(filter_enable, left + 110, top, 78, 26, TRUE);
+        MoveWindow(archive_match_case, left + 190, top, 110, 26, TRUE);
+        const int filter_width = std::max((right - left - 88) / 2, 20);
+        MoveWindow(include_text, left, top + 30, filter_width, 26, TRUE);
+        MoveWindow(exclude_text, left + filter_width + 4, top + 30, filter_width, 26, TRUE);
+        MoveWindow(filter_apply, right - 76, top + 30, 76, 26, TRUE);
+        MoveWindow(search, left, top + 60, std::max(right - left - 150, 20), 26, TRUE);
+        MoveWindow(find_previous, right - 144, top + 60, 76, 26, TRUE);
+        MoveWindow(find_next, right - 64, top + 60, 64, 26, TRUE);
+        MoveWindow(
+            archive,
+            left,
+            top + 90,
+            std::max(right - left, 20),
+            std::max(h - top - 132, 20),
+            TRUE
+        );
+        for (HWND child : {archive,
+                 archive_reload,
+                 archive_match_case,
+                 filter_enable,
+                 exclude_text,
+                 include_text,
+                 filter_apply,
+                 search,
+                 find_previous,
+                 find_next})
+        {
+            ShowWindow(child, archive_open ? SW_SHOW : SW_HIDE);
+        }
         MoveWindow(mcp, 12, h - 32, w - 24, 24, TRUE);
     }
 
@@ -436,12 +509,14 @@ struct App
             status,
             widen(s.port + " @ " + std::to_string(s.baud) + " | " + state + " " + s.notice)
         );
+        const auto cursor = log.committed();
+        const auto log_position =
+            cursor.line ? cursor.filename + ":" + std::to_string(cursor.line) : "pending";
         text(
             log_status,
             widen(
-                "log:" + log.filename() + " | input/view:" + (hex ? "hex" : "ascii") +
-                " | rx:" + std::to_string(s.rx) + "B tx:" + std::to_string(s.tx) +
-                "B dropped:" + std::to_string(s.dropped) +
+                "log:" + log_position + " | rx:" + std::to_string(s.rx) +
+                "B tx:" + std::to_string(s.tx) + "B dropped:" + std::to_string(s.dropped) +
                 " | display skipped:" + std::to_string(s.display_dropped) +
                 (log.error().empty() ? "" : " | log error: " + log.error())
             )
@@ -449,8 +524,8 @@ struct App
         text(
             mcp,
             widen(
-                "MCP" + (serial_id.empty() ? std::string{} : " | serial_id: " + serial_id) + " | " +
-                s.mcp
+                std::string("Live | MCP") +
+                (serial_id.empty() ? std::string{} : " | serial_id: " + serial_id) + " | " + s.mcp
             )
         );
         for (auto [id, b] : buttons)
@@ -459,10 +534,6 @@ struct App
             {
                 text(b, s.connected ? L"Disconnect" : L"Connect");
                 EnableWindow(b, !connection_job.has_value());
-            }
-            if (id == MODE)
-            {
-                text(b, hex ? L"HEX" : L"ASCII");
             }
             if (id == EOL)
             {
@@ -572,9 +643,6 @@ struct App
         }
         auto old = boundary;
         auto chosen = selection(terminal);
-        POINT scroll{};
-        SendMessageW(terminal, EM_GETSCROLLPOS, 0, reinterpret_cast<LPARAM>(&scroll));
-        bool follow = chosen.cpMin >= old;
         RedrawGuard redraw(terminal);
         long remove = std::min(old, patch.erase);
         select(terminal, old - remove, old);
@@ -599,33 +667,30 @@ struct App
             return n >= old ? n + delta : std::min(n, boundary);
         };
         select(terminal, shift(chosen.cpMin), shift(chosen.cpMax));
-        long budget = long(config.max_lines) * 1024;
-        if (boundary > budget)
+        // RichEdit has wrapping disabled. Its line indices include the active input row.
+        const auto last_line = SendMessageW(terminal, EM_EXLINEFROMCHAR, 0, boundary);
+        const auto excess = last_line + 1 - long(config.max_lines);
+        long trim = 0;
+        if (excess > 0)
         {
-            auto all = rich_text(terminal);
-            auto at = all.find(L'\r', size_t(boundary - budget / 2));
-            if (at != std::wstring::npos && at < size_t(boundary))
-            {
-                auto saved = selection(terminal);
-                select(terminal, 0, long(at + 1));
-                SendMessageW(terminal, EM_REPLACESEL, FALSE, reinterpret_cast<LPARAM>(L""));
-                boundary -= long(at + 1);
-                select(
-                    terminal,
-                    std::max(saved.cpMin - long(at + 1), 0L),
-                    std::max(saved.cpMax - long(at + 1), 0L)
-                );
-            }
+            trim = long(SendMessageW(terminal, EM_LINEINDEX, excess, 0));
+        }
+        const long budget = long(config.max_lines) * 1024;
+        if (boundary - trim > budget)
+        {
+            const auto line = SendMessageW(terminal, EM_EXLINEFROMCHAR, 0, boundary - budget / 2);
+            trim = std::max(trim, long(SendMessageW(terminal, EM_LINEINDEX, line, 0)));
+        }
+        if (trim > 0 && trim <= boundary)
+        {
+            auto saved = selection(terminal);
+            select(terminal, 0, trim);
+            SendMessageW(terminal, EM_REPLACESEL, FALSE, reinterpret_cast<LPARAM>(L""));
+            boundary -= trim;
+            select(terminal, std::max(saved.cpMin - trim, 0L), std::max(saved.cpMax - trim, 0L));
         }
         SendMessageW(terminal, EM_EMPTYUNDOBUFFER, 0, 0);
-        if (follow)
-        {
-            SendMessageW(terminal, EM_SCROLLCARET, 0, 0);
-        }
-        else
-        {
-            SendMessageW(terminal, EM_SETSCROLLPOS, 0, reinterpret_cast<LPARAM>(&scroll));
-        }
+        SendMessageW(terminal, WM_VSCROLL, SB_BOTTOM, 0);
     }
 
     void clear()
@@ -650,7 +715,7 @@ struct App
             {
                 throw std::runtime_error("command exceeds 65536 UTF-16 units");
             }
-            auto bytes = command_bytes(s, hex, eol);
+            auto bytes = command_bytes(s, false, eol);
             if (bytes.empty())
             {
                 return;
@@ -676,30 +741,156 @@ struct App
         }
     }
 
+    void set_archive_text(const wchar_t* contents)
+    {
+        SetWindowTextW(archive, contents);
+        select(archive, 0, -1);
+        color(archive, palette.fg);
+        select(archive, 0, 0);
+    }
+
+    void load_archive()
+    {
+        if (!archive_open || archive_job)
+        {
+            return;
+        }
+        const auto cursor = log.committed();
+        if (cursor.filename.empty())
+        {
+            set_archive_text(L"No log has been written yet.");
+            return;
+        }
+        const auto path = log.directory() / widen(cursor.filename);
+        const auto include = filter_enabled ? applied_include : std::wstring{};
+        const auto exclude = filter_enabled ? applied_exclude : std::wstring{};
+        const bool match_case = SendMessageW(archive_match_case, BM_GETCHECK, 0, 0) == BST_CHECKED;
+        // Capture the committed row count before reading so a concurrent append cannot
+        // introduce an incomplete row. The worker owns no window or session references.
+        archive_job.emplace(
+            std::async(
+                std::launch::async,
+                [path, cursor, include, exclude, match_case]
+                {
+                    std::ifstream file(path, std::ios::binary);
+                    if (!file)
+                    {
+                        return std::wstring(L"Unable to read the log file.");
+                    }
+                    std::wstring output;
+                    std::string row;
+                    for (uint64_t i = 0; i < cursor.line && std::getline(file, row); ++i)
+                    {
+                        const auto line = widen(row);
+                        const auto matches = [&](const std::wstring& pattern)
+                        {
+                            if (pattern.size() > line.size())
+                            {
+                                return false;
+                            }
+                            if (match_case)
+                            {
+                                return line.find(pattern) != std::wstring::npos;
+                            }
+                            return FindStringOrdinal(
+                                       FIND_FROMSTART,
+                                       line.data(),
+                                       int(line.size()),
+                                       pattern.data(),
+                                       int(pattern.size()),
+                                       TRUE
+                                   ) >= 0;
+                        };
+                        if ((include.empty() || matches(include)) &&
+                            (exclude.empty() || !matches(exclude)))
+                        {
+                            output += line;
+                            output += L'\n';
+                        }
+                    }
+                    if (file.bad())
+                    {
+                        return std::wstring(L"Unable to read the log file.");
+                    }
+                    return output;
+                }
+            )
+        );
+        EnableWindow(archive_reload, FALSE);
+        EnableWindow(archive_match_case, FALSE);
+        EnableWindow(filter_apply, FALSE);
+        EnableWindow(filter_enable, FALSE);
+    }
+
+    void find_output(bool forward)
+    {
+        auto query = get_text(search);
+        if (query.empty())
+        {
+            SetFocus(search);
+            return;
+        }
+        const auto selected = selection(archive);
+        const long boundary = long(GetWindowTextLengthW(archive));
+        FINDTEXTEXW match{};
+        match.lpstrText = query.data();
+        if (forward)
+        {
+            match.chrg = {std::min(selected.cpMax, boundary), boundary};
+        }
+        else
+        {
+            match.chrg = {std::min(selected.cpMin, boundary), 0};
+        }
+        const auto result = SendMessageW(
+            archive,
+            EM_FINDTEXTEXW,
+            (forward ? FR_DOWN : 0) |
+                (SendMessageW(archive_match_case, BM_GETCHECK, 0, 0) == BST_CHECKED ? FR_MATCHCASE
+                                                                                    : 0),
+            reinterpret_cast<LPARAM>(&match)
+        );
+        if (result < 0)
+        {
+            MessageBoxW(window, L"No further match in this direction.", L"Search", MB_OK);
+            return;
+        }
+        SetFocus(archive);
+        select(archive, match.chrgText.cpMin, match.chrgText.cpMax);
+        SendMessageW(archive, EM_SCROLLCARET, 0, 0);
+    }
+
     void command(int id)
     {
         try
         {
-            if (id == FILTER_ENABLE)
+            if (id == LOG_TOGGLE)
             {
-                filter_enabled = SendMessageW(filter_enable, BM_GETCHECK, 0, 0) == BST_CHECKED;
-                clear();
+                archive_open = !archive_open;
+                SetWindowTextW(archive_toggle, archive_open ? L"<" : L">");
+                layout();
+                load_archive();
+                return;
             }
-            else if (id == FILTER_APPLY)
+            if (id == LOG_RELOAD || id == LOG_MATCH_CASE)
             {
-                auto pattern = get_text(filter_text);
-                bool exclude = SendMessageW(filter_mode, CB_GETCURSEL, 0, 0) == 1;
-                // Predicate and parser belong to this GUI page and never touch persisted records.
-                display.visible = [this, pattern, exclude](const std::wstring& body)
+                load_archive();
+                return;
+            }
+            if (id == FIND_NEXT || id == FIND_PREVIOUS)
+            {
+                find_output(id == FIND_NEXT);
+                return;
+            }
+            if (id == FILTER_ENABLE || id == FILTER_APPLY)
+            {
+                if (id == FILTER_APPLY)
                 {
-                    if (!filter_enabled || pattern.empty())
-                    {
-                        return true;
-                    }
-                    bool match = body.find(pattern) != std::wstring::npos;
-                    return exclude ? !match : match;
-                };
-                clear();
+                    applied_include = get_text(include_text);
+                    applied_exclude = get_text(exclude_text);
+                }
+                filter_enabled = SendMessageW(filter_enable, BM_GETCHECK, 0, 0) == BST_CHECKED;
+                load_archive();
             }
             else if (id == CONNECTION)
             {
@@ -738,12 +929,6 @@ struct App
             {
                 scan_ports();
             }
-            else if (id == MODE)
-            {
-                hex = !hex;
-                display.reset();
-                apply({0, {{L"\r", palette.fg}}});
-            }
             else if (id == EOL)
             {
                 eol = eol == "crlf" ? "none" : eol == "none" ? "cr" : eol == "cr" ? "lf" : "crlf";
@@ -763,6 +948,26 @@ struct App
 
     void tick()
     {
+        if (archive_job &&
+            archive_job->wait_for(std::chrono::seconds(0)) == std::future_status::ready)
+        {
+            std::wstring contents;
+            try
+            {
+                contents = archive_job->get();
+            }
+            catch (const std::exception&)
+            {
+                contents = L"Unable to load the log file.";
+            }
+            archive_job.reset();
+            set_archive_text(contents.c_str());
+            EnableWindow(archive_reload, TRUE);
+            EnableWindow(archive_match_case, TRUE);
+            EnableWindow(filter_apply, TRUE);
+            EnableWindow(filter_enable, TRUE);
+        }
+
         if (restart.ready())
         {
             PostMessageW(GetAncestor(window, GA_ROOT), WM_CLOSE, 0, 0);
@@ -813,16 +1018,11 @@ struct App
             scan_ports();
         }
         labels();
-        auto chosen = selection(terminal);
-        if (chosen.cpMin != chosen.cpMax && chosen.cpMin < boundary)
-        {
-            return;
-        }
         Patch batch;
         auto state = core.state();
         if (state.display_dropped != last_display_dropped)
         {
-            display.reset();
+            batch.erase = display.reset();
             batch.pieces.push_back({L"\r[display backlog skipped; see file log]\r", palette.dim});
             last_display_dropped = state.display_dropped;
         }
@@ -831,7 +1031,7 @@ struct App
         {
             if (record.dir != Direction::Status)
             {
-                batch.append(display.feed(record, hex));
+                batch.append(display.feed(record, false));
             }
         }
         apply(std::move(batch));
@@ -2028,16 +2228,6 @@ int receive_stress_test()
         {
             while (Clock::now() - start < std::chrono::seconds(duration))
             {
-                if (Clock::now() - start >= std::chrono::seconds(duration / 2))
-                {
-                    auto& page = *workspace.panels.at(workspace.active).app;
-                    if (!page.hex)
-                    {
-                        page.hex = true;
-                        page.display.reset();
-                        page.apply({0, {{L"\r", page.palette.fg}}});
-                    }
-                }
                 auto began = Clock::now();
                 MSG message{};
                 // Dispatch one message before rechecking deadlines; a busy queue cannot starve cleanup.
@@ -2096,7 +2286,7 @@ int receive_stress_test()
                         GetGuiResources(GetCurrentProcess(), GR_USEROBJECTS),
                         worst,
                         threads,
-                        workspace.panels.at(workspace.active).app->hex ? "hex" : "ascii"
+                        "text"
                     );
                     std::fflush(stdout);
                     next = Clock::now() + std::chrono::seconds(1);
@@ -2182,8 +2372,6 @@ void native_tests(Core& core, LogWriter& log, Restart& restart)
                 rich_text(b.terminal).find(L"only A") == std::wstring::npos,
                 "tab output isolation"
             );
-            a.command(MODE);
-            require(a.hex && !b.hex, "tab input/view mode isolation");
             // Exercise real mouse hit targets, including closing an inactive tab.
             auto click = [&](const RECT& rectangle)
             {
@@ -2225,6 +2413,23 @@ void native_tests(Core& core, LogWriter& log, Restart& restart)
         a.apply(a.display.feed({Direction::Rx, "prompt中文😀", stamp()}, false));
         if (check)
         {
+            a.set_archive_text(L"Log preview");
+            select(a.archive, 0, -1);
+            CHARFORMATW archive_format{};
+            archive_format.cbSize = sizeof archive_format;
+            SendMessageW(
+                a.archive,
+                EM_GETCHARFORMAT,
+                SCF_SELECTION,
+                reinterpret_cast<LPARAM>(&archive_format)
+            );
+            require(
+                rich_text(a.archive) == L"Log preview" &&
+                    (archive_format.dwMask & CFM_COLOR) != 0 &&
+                    (archive_format.dwEffects & CFE_AUTOCOLOR) == 0 &&
+                    archive_format.crTextColor == a.palette.fg,
+                "log preview uses the theme foreground after replacing its contents"
+            );
             require(a.draft() == L"help中文😀", "native draft preservation");
             auto all = rich_text(a.terminal);
             select(a.terminal, a.boundary, a.boundary);
@@ -2244,8 +2449,6 @@ void native_tests(Core& core, LogWriter& log, Restart& restart)
             require(format.crTextColor == a.palette.dim, "native dim timestamp");
             a.clear();
             require(a.boundary == 0 && a.draft() == L"help中文😀", "clear preserves draft");
-            a.command(MODE);
-            require(a.hex, "mode button");
             a.command(EOL);
             require(a.eol == "none", "line ending button");
             a.clear();

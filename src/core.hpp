@@ -5,6 +5,12 @@
 
 namespace sm
 {
+struct LogCursor
+{
+    std::string filename;
+    uint64_t line = 0; // One-based last flushed row; zero denotes no row.
+};
+
 class LogWriter
 {
     Config config_;
@@ -18,6 +24,7 @@ class LogWriter
     bool accepting_ = true;
     std::thread worker_;
     std::string filename_;
+    LogCursor committed_;
     std::string error_;
     void loop();
 
@@ -34,6 +41,13 @@ public:
     release_producers(); // Wake backpressured producers before core shutdown; the log thread drains already queued records.
     void stop();
     std::string filename();
+    LogCursor committed();
+
+    const fs::path& directory() const
+    {
+        return config_.log_dir;
+    }
+
     std::string error();
 };
 

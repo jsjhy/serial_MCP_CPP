@@ -65,6 +65,12 @@ std::string LogWriter::filename()
     return filename_.empty() ? "pending" : filename_;
 }
 
+LogCursor LogWriter::committed()
+{
+    std::lock_guard lock(mutex_);
+    return committed_;
+}
+
 std::string LogWriter::error()
 {
     std::lock_guard lock(mutex_);
@@ -76,7 +82,9 @@ void LogWriter::loop()
     std::ofstream file;
     uint64_t written = 0, sequence = 0;
     std::string pending;
+    uint64_t rows = 0;
     bool line = false;
+    size_t complete = 0; // Byte count through the last complete UTF-8 log row.
     std::optional<Direction> direction;
     TextParser parser(RGB(255, 255, 255));
     std::string time;
@@ -103,6 +111,7 @@ void LogWriter::loop()
         if (s == L"\r")
         {
             pending += '\n';
+            complete = pending.size();
             line = false;
         }
         else
@@ -112,14 +121,14 @@ void LogWriter::loop()
     };
     auto flush = [&]
     {
-        if (pending.empty())
+        if (!complete)
         {
             return;
         }
         try
         {
             fs::create_directories(config_.log_dir);
-            if (!file.is_open() || written + pending.size() > config_.rotate)
+            if (!file.is_open() || written >= config_.rotate)
             {
                 if (file.is_open())
                 {
@@ -130,6 +139,12 @@ void LogWriter::loop()
                     "serial_" + stamp(true) + "_" + std::to_string(++sequence) + ".log";
                 std::replace(name.begin(), name.end(), ':', '-');
                 std::replace(name.begin(), name.end(), ' ', '_');
+                while (fs::exists(config_.log_dir / widen(name)))
+                {
+                    name =
+                        name.substr(0, name.rfind('_') + 1) + std::to_string(++sequence) + ".log";
+                }
+                rows = 0;
                 file.clear();
                 file.open(config_.log_dir / widen(name), std::ios::binary | std::ios::app);
                 if (!file)
@@ -159,16 +174,19 @@ void LogWriter::loop()
                     }
                 }
             }
-            file.write(pending.data(), std::streamsize(pending.size()));
+            file.write(pending.data(), std::streamsize(complete));
             file.flush();
             if (!file)
             {
                 throw std::runtime_error("log write/flush failed");
             }
-            written += pending.size();
-            pending.clear();
+            written += complete;
+            rows += std::count(pending.begin(), pending.begin() + complete, '\n');
+            pending.erase(0, complete);
+            complete = 0;
             {
                 std::lock_guard lock(mutex_);
+                committed_ = {filename_, rows};
                 error_.clear();
             }
         }
@@ -198,7 +216,7 @@ void LogWriter::loop()
             );
             end = stopping_;
             // Bound formatted data on disk failure; retain pending output and retry so backpressure reaches producers.
-            if (pending.size() < queue_limit_)
+            if (complete < queue_limit_)
             {
                 size_t batch_bytes = 0;
                 for (unsigned i = 0; i < 64 && !queue_.empty(); ++i)
@@ -223,8 +241,7 @@ void LogWriter::loop()
                 parser.finish(emit);
                 if (line)
                 {
-                    pending += '\n';
-                    line = false;
+                    emit(L"\r", RGB(255, 255, 255));
                 }
                 parser = TextParser(RGB(255, 255, 255));
                 direction = r.dir;
@@ -236,12 +253,11 @@ void LogWriter::loop()
                 parser.finish(emit);
                 if (line)
                 {
-                    pending += '\n';
-                    line = false;
+                    emit(L"\r", RGB(255, 255, 255));
                 }
             }
         }
-        if (pending.size() >= config_.flush_bytes ||
+        if (complete >= config_.flush_bytes ||
             Clock::now() - last >= std::chrono::milliseconds(config_.flush_ms) || end)
         {
             flush();
@@ -252,7 +268,7 @@ void LogWriter::loop()
             parser.finish(emit);
             if (line)
             {
-                pending += '\n';
+                emit(L"\r", RGB(255, 255, 255));
             }
             flush();
             break;
@@ -260,12 +276,12 @@ void LogWriter::loop()
         // Do not wait forever on persistent shutdown disk errors. Report failure without claiming the tail is durable.
         {
             std::lock_guard lock(mutex_);
-            if (stopping_ && !error_.empty() && pending.size() >= queue_limit_)
+            if (stopping_ && !error_.empty() && complete >= queue_limit_)
             {
                 break;
             }
         }
-        if (pending.size() >= queue_limit_)
+        if (complete >= queue_limit_)
         {
             std::this_thread::sleep_for(std::chrono::milliseconds(config_.flush_ms));
         }

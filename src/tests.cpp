@@ -4,6 +4,10 @@
 
 namespace sm
 {
+#ifdef SERIAL_MCP_SIMULATED_TESTS
+void simulated_serial_log_test(Config config);
+#endif
+
 int self_test()
 {
     unsigned checks = 0;
@@ -343,6 +347,9 @@ int self_test()
         writer.get();
         check(!log.error().empty(), "disk failure must be reported");
     }
+#ifdef SERIAL_MCP_SIMULATED_TESTS
+    simulated_serial_log_test(cfg);
+#endif
     fs::remove_all(dir);
     std::printf(
         "PASS: %u assertions, codecs, JSON, streaming text, log tail, disconnected I/O, native controls/resources\n",
