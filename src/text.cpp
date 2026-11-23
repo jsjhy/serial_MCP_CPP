@@ -375,7 +375,7 @@ Patch Display::feed(const Record& rec, bool hex)
         prefix();
         if (rec.dir == Direction::Tx)
         {
-            add(L"TX: ", palette_.fg);
+            add(L"[TX] ", palette_.fg);
         }
         else if (rec.dir == Direction::Status)
         {

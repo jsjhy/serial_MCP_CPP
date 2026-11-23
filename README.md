@@ -68,7 +68,7 @@ HTTP MCP 客户端会话最多 128 个、五分钟空闲过期；HTTP 请求体�
 
 ## 日志、配置与测试边界
 
-日志按 `log_dir/serial-N/` 隔离，各自轮转并清理其目录中的过期文件。日志 UTF-8，RX 不带方向前缀，TX/STATUS 保留。跨包 UTF-8/ANSI 解码，按大小轮转、按保留天数清理；程序退出刷新尾部，flush 不等于断电持久化。失败保留待写批次并报告错误，退出遇到持续磁盘故障可能丢失未写尾部。CLI > 配置 > 默认；支持项目示例所示的 TOML 标量及 [gui]（兼容旧 [tui] 表名），不是通用 TOML 解析器。--watch-config 仅重新应用启动会话的 port/baud；若该会话被删除，不会复活它。其他会话通过 GUI/MCP 配置。
+日志按 `log_dir/serial-N/` 隔离，各自轮转并清理其目录中的过期文件。日志 UTF-8，RX 不带方向前缀，TX 使用 [TX] 标记，STATUS 保留。跨包 UTF-8/ANSI 解码，按大小轮转、按保留天数清理；程序退出刷新尾部，flush 不等于断电持久化。失败保留待写批次并报告错误，退出遇到持续磁盘故障可能丢失未写尾部。CLI > 配置 > 默认；支持项目示例所示的 TOML 标量及 [gui]（兼容旧 [tui] 表名），不是通用 TOML 解析器。--watch-config 仅重新应用启动会话的 port/baud；若该会话被删除，不会复活它。其他会话通过 GUI/MCP 配置。
 
 `dist/serial_mcp_gui.exe --self-test` 验证 JSON/Unicode/命令编码、日志尾部、无效端口错误、真实隐藏 RichEdit 输入边界，并在预热后创建/销毁 100 个窗口比较 GDI/USER/句柄计数。另外验证隐藏多标签页隔离、独立队列、16 会话上限及 30 次会话回收。该测试不访问真实设备、不改系统剪贴板，不代表真实串口、拔插或长期运行验证。
 
@@ -112,7 +112,9 @@ toggles the applied filter. An empty filter shows every row. **Previous** and
 **Next** search the displayed log rows without wrapping. **Match case** controls
 case sensitivity for both filtering and searching and is checked by default.
 
-Log writes publish complete UTF-8 rows. Unfinished rows are buffered until a line ending, direction change, or clean shutdown. Rotation occurs between complete batches, so the size threshold is soft. A stream without line endings can accumulate an unfinished row in memory.
+Log writes automatically flush decoded UTF-8 output by the configured byte or time threshold, including unfinished rows. Later data continues the same row. Incomplete UTF-8 sequences remain buffered until decoded or finalized. Rotation waits for a row boundary. The log viewer reads a snapshot of the current file, including its saved partial last row. Flush does not guarantee power-loss durability.
 
 The optional simulated serial regression lives in `tests/`. Configure with `-DSERIAL_MCP_SIMULATED_TESTS=ON`, build, then run `ctest --test-dir build/cmake -R self_tests --output-on-failure`. The CMake option enables the matching compile macro and defaults to OFF. The test injects synthetic RX chunks into the log writer and uses a temporary directory.
 
+
+Select text in the log viewer and right-click to open its Copy menu. Copy is disabled when no text is selected.

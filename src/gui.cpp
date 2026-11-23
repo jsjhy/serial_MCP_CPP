@@ -386,6 +386,10 @@ struct App
             SCF_DEFAULT,
             reinterpret_cast<LPARAM>(&archive_format)
         );
+        if (!SetWindowSubclass(archive, archive_proc, 3, 0))
+        {
+            throw std::runtime_error("Log viewer subclass failed");
+        }
         SetTimer(window, 1, 33, nullptr);
         layout();
         scan_ports();
@@ -1035,6 +1039,52 @@ struct App
             }
         }
         apply(std::move(batch));
+    }
+
+    // The log control owns its subclass lifetime. Popup menus are released before return.
+    static LRESULT CALLBACK archive_proc(HWND h, UINT m, WPARAM w, LPARAM l, UINT_PTR, DWORD_PTR)
+    {
+        if (m == WM_NCDESTROY)
+        {
+            RemoveWindowSubclass(h, archive_proc, 3);
+        }
+        if (m == WM_CONTEXTMENU)
+        {
+            const auto chosen = selection(h);
+            HMENU menu = CreatePopupMenu();
+            if (!menu)
+            {
+                return 0;
+            }
+            AppendMenuW(
+                menu,
+                MF_STRING | (chosen.cpMin == chosen.cpMax ? MF_GRAYED : MF_ENABLED),
+                1,
+                L"Copy"
+            );
+            POINT point{short(LOWORD(l)), short(HIWORD(l))};
+            if (point.x == -1 && point.y == -1)
+            {
+                point = {8, 8};
+                ClientToScreen(h, &point);
+            }
+            const auto command = TrackPopupMenu(
+                menu,
+                TPM_RETURNCMD | TPM_RIGHTBUTTON,
+                point.x,
+                point.y,
+                0,
+                h,
+                nullptr
+            );
+            DestroyMenu(menu);
+            if (command == 1)
+            {
+                SendMessageW(h, WM_COPY, 0, 0);
+            }
+            return 0;
+        }
+        return DefSubclassProc(h, m, w, l);
     }
 
     static LRESULT CALLBACK

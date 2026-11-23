@@ -84,6 +84,7 @@ void LogWriter::loop()
     std::string pending;
     uint64_t rows = 0;
     bool line = false;
+    bool saved_partial = false;
     size_t complete = 0; // Byte count through the last complete UTF-8 log row.
     std::optional<Direction> direction;
     TextParser parser(RGB(255, 255, 255));
@@ -100,7 +101,7 @@ void LogWriter::loop()
             pending += "[" + time + "] ";
             if (direction == Direction::Tx)
             {
-                pending += "TX: ";
+                pending += "[TX] ";
             }
             if (direction == Direction::Status)
             {
@@ -121,6 +122,8 @@ void LogWriter::loop()
     };
     auto flush = [&]
     {
+        // Persist decoded partial rows without adding a newline or resetting parser state.
+        complete = pending.size();
         if (!complete)
         {
             return;
@@ -128,7 +131,7 @@ void LogWriter::loop()
         try
         {
             fs::create_directories(config_.log_dir);
-            if (!file.is_open() || written >= config_.rotate)
+            if (!file.is_open() || (written >= config_.rotate && !saved_partial))
             {
                 if (file.is_open())
                 {
@@ -181,12 +184,13 @@ void LogWriter::loop()
                 throw std::runtime_error("log write/flush failed");
             }
             written += complete;
+            saved_partial = line;
             rows += std::count(pending.begin(), pending.begin() + complete, '\n');
             pending.erase(0, complete);
             complete = 0;
             {
                 std::lock_guard lock(mutex_);
-                committed_ = {filename_, rows};
+                committed_ = {filename_, rows + (line ? 1u : 0u)};
                 error_.clear();
             }
         }

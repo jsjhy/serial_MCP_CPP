@@ -7,3 +7,4 @@
 # Python bytecode caches.
 __pycache__/
 *.pyc
+dist.zip
